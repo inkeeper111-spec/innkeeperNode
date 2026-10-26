@@ -48,7 +48,7 @@ router.post('/attendance/check-in', checkIn);
 router.post('/attendance/check-out', checkOut);
 router.get('/attendance/me', getMyAttendance);
 router.get('/attendance',         getAttendance);
-router.post('/attendance',        recordAttendance);
+router.post('/attendance',        authorize(ROLES.HOTEL_ADMIN), recordAttendance);
 router.patch('/attendance/:id',   authorize(ROLES.HOTEL_ADMIN), updateAttendance);
 
 router.get('/leave', getLeaves);

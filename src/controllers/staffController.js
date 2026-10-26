@@ -232,15 +232,20 @@ export const getAttendance = async (req, res, next) => {
 export const recordAttendance = async (req, res, next) => {
   try {
     const { userId, date, checkInTime, checkOutTime, status, notes } = req.body;
+    const attendanceUserId = userId || req.user._id;
+    const employee = await User.findOne({ _id: attendanceUserId, hotelId: req.hotelId, role: { $ne: ROLES.GUEST } });
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found for this hotel.' });
+    }
 
     const attendanceDate = dayjs(date || new Date()).startOf('day').toDate();
 
     // Upsert — if record for this user+date already exists, update it
     const record = await Attendance.findOneAndUpdate(
-      { hotelId: req.hotelId, userId: userId || req.user._id, date: attendanceDate },
+      { hotelId: req.hotelId, userId: attendanceUserId, date: attendanceDate },
       {
         hotelId: req.hotelId,
-        userId:  userId || req.user._id,
+        userId:  attendanceUserId,
         date:    attendanceDate,
         checkInTime:  checkInTime  || '09:00',
         checkOutTime: checkOutTime || '',
@@ -598,41 +603,58 @@ export const processSalary = async (req, res, next) => {
 
 export const checkIn = async (req, res, next) => {
   try {
-    const attendanceDate = dayjs().startOf('day').toDate();
-    const time = nowTime();
-    const late = dayjs(`${dayjs().format('YYYY-MM-DD')} ${time}`).isAfter(dayjs(`${dayjs().format('YYYY-MM-DD')} 09:15`));
-    const record = await Attendance.findOneAndUpdate(
-      { hotelId: req.hotelId, userId: req.user._id, date: attendanceDate },
-      {
-        $setOnInsert: {
-          hotelId: req.hotelId,
-          userId: req.user._id,
-          date: attendanceDate,
-          checkInTime: time,
-          status: late ? 'late' : 'present'
-        }
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    if (record.checkInTime && record.checkInTime !== time && record.checkOutTime) {
-      return res.json({ success: true, message: 'Already checked in today.', data: record });
+    if (req.user.role === ROLES.GUEST) {
+      return res.status(403).json({ success: false, message: 'Guests cannot record employee attendance.' });
     }
+
+    const timestamp = new Date();
+    const attendanceDate = dayjs(timestamp).startOf('day').toDate();
+    const time = dayjs(timestamp).format('HH:mm');
+    const late = dayjs(`${dayjs().format('YYYY-MM-DD')} ${time}`).isAfter(dayjs(`${dayjs().format('YYYY-MM-DD')} 09:15`));
+    const existing = await Attendance.findOne({ hotelId: req.hotelId, userId: req.user._id, date: attendanceDate });
+    if (existing?.checkInTime) {
+      return res.status(409).json({ success: false, message: 'Already checked in today.', data: existing });
+    }
+
+    const record = await Attendance.create({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      date: attendanceDate,
+      checkInAt: timestamp,
+      checkInTime: time,
+      status: late ? 'late' : 'present'
+    });
     res.json({ success: true, message: `Checked in at ${record.checkInTime}.`, data: record });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: 'Already checked in today.' });
+    }
     next(err);
   }
 };
 
 export const checkOut = async (req, res, next) => {
   try {
-    const attendanceDate = dayjs().startOf('day').toDate();
-    const time = nowTime();
+    if (req.user.role === ROLES.GUEST) {
+      return res.status(403).json({ success: false, message: 'Guests cannot record employee attendance.' });
+    }
+
+    const timestamp = new Date();
+    const attendanceDate = dayjs(timestamp).startOf('day').toDate();
+    const time = dayjs(timestamp).format('HH:mm');
     const record = await Attendance.findOne({ hotelId: req.hotelId, userId: req.user._id, date: attendanceDate });
-    if (!record) {
+    if (!record?.checkInTime) {
       return res.status(400).json({ success: false, message: 'Check in before checking out.' });
     }
+    if (record.checkOutTime) {
+      return res.status(409).json({ success: false, message: 'Already checked out today.', data: record });
+    }
+
+    record.checkOutAt = timestamp;
     record.checkOutTime = time;
-    record.workingHours = calcHours(record.checkInTime, time);
+    record.workingHours = record.checkInAt
+      ? Math.max(0, Math.round(((timestamp - record.checkInAt) / 3600000) * 100) / 100)
+      : calcHours(record.checkInTime, time);
     if (record.workingHours > 0 && record.workingHours < 5 && record.status === 'present') {
       record.status = 'half_day';
     }
