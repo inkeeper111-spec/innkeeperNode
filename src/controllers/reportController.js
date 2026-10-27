@@ -25,7 +25,7 @@ export const getDashboardSummary = async (req, res, next) => {
     // 2. Today's Arrivals and Departures
     const todayArrivals = await Reservation.countDocuments({
       hotelId,
-      status: { $in: [RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
+      status: { $in: [RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
       checkInDate: { $gte: todayStart, $lte: todayEnd }
     });
 
@@ -75,7 +75,7 @@ export const getDashboardSummary = async (req, res, next) => {
     // 5. Active Reservations
     const activeReservations = await Reservation.countDocuments({
       hotelId,
-      status: { $in: [RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] }
+      status: { $in: [RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] }
     });
 
     // 6. Recent lists
@@ -247,4 +247,3 @@ export const exportReportCSV = async (req, res, next) => {
     next(err);
   }
 };
-

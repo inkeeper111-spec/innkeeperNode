@@ -17,6 +17,7 @@ export { HousekeepingTask } from './HousekeepingTask.js';
 export { MenuCategory } from './MenuCategory.js';
 export { MenuItem } from './MenuItem.js';
 export { FoodOrder } from './FoodOrder.js';
+export { RestaurantTable } from './RestaurantTable.js';
 export { InventoryItem } from './InventoryItem.js';
 export { StockMovement } from './StockMovement.js';
 export { Vendor } from './Vendor.js';
@@ -25,7 +26,7 @@ export { Expense } from './Expense.js';
 export { StaffProfile } from './StaffProfile.js';
 export { Shift } from './Shift.js';
 export { Attendance } from './Attendance.js';
+export { AttendanceLocationAudit } from './AttendanceLocationAudit.js';
 export { MaintenanceTicket } from './MaintenanceTicket.js';
 export { Notification } from './Notification.js';
 export { AuditLog } from './AuditLog.js';
-

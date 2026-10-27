@@ -3,6 +3,7 @@ import { User, Hotel } from '../models/index.js';
 import { ROLES, HOTEL_STATUS } from '../config/constants.js';
 
 export const authenticate = async (req, res, next) => {
+  let decoded;
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -10,8 +11,12 @@ export const authenticate = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_jwt_key_change_in_production_grandstay_2026');
+    decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_jwt_key_change_in_production_grandstay_2026');
+  } catch {
+    return res.status(401).json({ success: false, message: 'Invalid or expired authentication token.' });
+  }
 
+  try {
     const user = await User.findById(decoded.id);
     if (!user || !user.isActive) {
       return res.status(401).json({ success: false, message: 'Account not found or inactive.' });
@@ -20,7 +25,7 @@ export const authenticate = async (req, res, next) => {
     req.user = user;
     next();
   } catch (err) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired authentication token.' });
+    return next(err);
   }
 };
 
@@ -50,6 +55,10 @@ export const requireTenant = async (req, res, next) => {
   if (req.user.role === ROLES.SUPER_ADMIN) {
     req.hotelId = req.headers['x-hotel-id'] || req.query.hotelId || req.user.hotelId;
     return next();
+  }
+
+  if (req.user.role === ROLES.GUEST) {
+    return res.status(403).json({ success: false, message: 'Guest accounts cannot access staff operations.' });
   }
 
   // Regular tenant users must have an assigned hotelId
@@ -91,4 +100,3 @@ export const requireTenant = async (req, res, next) => {
   req.hotel = hotel;
   next();
 };
-

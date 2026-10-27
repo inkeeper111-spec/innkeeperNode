@@ -1,4 +1,5 @@
 import { Guest, Reservation, Invoice } from '../models/index.js';
+import { notifyRoles } from '../services/notificationService.js';
 
 export const getGuests = async (req, res, next) => {
   try {
@@ -41,6 +42,17 @@ export const createGuest = async (req, res, next) => {
     const guest = await Guest.create({
       ...req.body,
       hotelId: req.hotelId
+    });
+    await notifyRoles({
+      hotelId: req.hotelId,
+      roles: ['hotel_admin', 'receptionist'],
+      title: 'Guest registered',
+      message: 'A new guest profile was registered.',
+      module: 'guests',
+      eventType: 'guest_registered',
+      relatedRecordId: guest._id,
+      link: '/guests',
+      eventId: `guest-created:${guest._id}`
     });
 
     res.status(201).json({
@@ -101,4 +113,3 @@ export const updateGuest = async (req, res, next) => {
     next(err);
   }
 };
-

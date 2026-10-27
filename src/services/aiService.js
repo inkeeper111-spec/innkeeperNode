@@ -59,7 +59,7 @@ export const getAIAnalytics = async (hotelId, queryText = '') => {
   // 4. Room Nights Sold & ADR / RevPAR
   const bookingsThisMonth = await Reservation.find({
     hotelId,
-    status: { $in: [RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN, RESERVATION_STATUS.CHECKED_OUT] },
+    status: { $in: [RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN, RESERVATION_STATUS.CHECKED_OUT] },
     checkInDate: { $gte: startOfMonth, $lte: endOfMonth }
   });
 
@@ -184,4 +184,3 @@ export const getAIAnalytics = async (hotelId, queryText = '') => {
     }
   };
 };
-

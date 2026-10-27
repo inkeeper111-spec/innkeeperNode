@@ -1,6 +1,7 @@
-import { InventoryItem, StockMovement, Vendor, PurchaseOrder, Notification } from '../models/index.js';
+import { InventoryItem, StockMovement, Vendor, PurchaseOrder } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
+import { notifyHotelOperations, notifyRoles } from '../services/notificationService.js';
 
 export const getInventoryItems = async (req, res, next) => {
   try {
@@ -28,6 +29,16 @@ export const createInventoryItem = async (req, res, next) => {
       ...req.body,
       hotelId: req.hotelId,
       propertyId: req.propertyId
+    });
+    await notifyHotelOperations({
+      hotelId: req.hotelId,
+      title: 'Inventory item added',
+      message: 'A new inventory item was added.',
+      module: 'inventory',
+      eventType: 'inventory_item_created',
+      relatedRecordId: item._id,
+      link: '/inventory',
+      eventId: `inventory-item-created:${item._id}`
     });
 
     res.status(201).json({ success: true, data: item });
@@ -83,12 +94,17 @@ export const recordStockMovement = async (req, res, next) => {
 
     // Check low stock trigger
     if (newStock <= item.minStockThreshold) {
-      await Notification.create({
+      await notifyRoles({
         hotelId: req.hotelId,
+        roles: ['hotel_admin', 'restaurant_staff'],
         title: 'Low Stock Alert',
-        message: `${item.name} is down to ${newStock} ${item.unit} (Minimum: ${item.minStockThreshold}).`,
-        type: 'inventory',
-        link: '/inventory'
+        message: `An inventory item is below its minimum stock threshold (${newStock} ${item.unit}).`,
+        module: 'inventory',
+        eventType: 'inventory_low_stock',
+        relatedRecordId: item._id,
+        priority: 'high',
+        link: '/inventory',
+        eventId: `low-stock:${movement._id}`
       });
     }
 
@@ -214,4 +230,3 @@ export const receivePurchaseOrder = async (req, res, next) => {
     next(err);
   }
 };
-

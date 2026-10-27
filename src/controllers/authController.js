@@ -1,8 +1,9 @@
 import crypto from 'crypto';
-import { User, Hotel, Property, SubscriptionPlan, Subscription, Notification } from '../models/index.js';
+import { User, Hotel, Property, SubscriptionPlan, Subscription } from '../models/index.js';
 import { ROLES, HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 import { generateTokens, verifyRefreshToken } from '../utils/token.js';
 import { sendEmail } from '../services/emailService.js';
+import { notifyPlatformAdmins } from '../services/notificationService.js';
 import { logAudit } from '../services/auditService.js';
 
 export const register = async (req, res, next) => {
@@ -134,15 +135,17 @@ export const register = async (req, res, next) => {
       details: { hotelName, slug }
     });
 
-    const platformAdmins = await User.find({ role: ROLES.SUPER_ADMIN, isActive: true }).select('_id');
-    await Notification.insertMany(platformAdmins.map((admin) => ({
-      userId: admin._id,
-      recipientRole: ROLES.SUPER_ADMIN,
+    await notifyPlatformAdmins({
+      hotelId: hotel._id,
       title: 'New hotel application received',
       message: `${hotel.name} has submitted its first administrator account for approval.`,
-      type: 'system',
-      link: '/superadmin'
-    })));
+      module: 'platform',
+      eventType: 'hotel_registered',
+      relatedRecordId: hotel._id,
+      priority: 'medium',
+      link: '/superadmin',
+      eventId: `hotel-registered:${hotel._id}`
+    });
 
     // Send Welcome Email
     sendEmail({
@@ -204,6 +207,17 @@ export const login = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Your account has been deactivated. Please contact administrator.' });
     }
 
+    const { portal } = req.body;
+    if (portal && !['staff', 'guest'].includes(portal)) {
+      return res.status(400).json({ success: false, message: 'Unsupported portal.' });
+    }
+    if (portal === 'staff' && user.role === ROLES.GUEST) {
+      return res.status(403).json({ success: false, message: 'Guest accounts cannot sign in to the staff portal.' });
+    }
+    if (portal === 'guest' && user.role !== ROLES.GUEST) {
+      return res.status(403).json({ success: false, message: 'This account cannot sign in to the guest portal.' });
+    }
+
     let hotel = null;
     if (user.hotelId) {
       hotel = await Hotel.findById(user.hotelId);
@@ -252,7 +266,8 @@ export const login = async (req, res, next) => {
           name: hotel.name,
           slug: hotel.slug,
           status: hotel.status,
-          currency: hotel.currency
+          currency: hotel.currency,
+          attendanceLocation: hotel.attendanceLocation
         } : null,
         homePath: user.role === ROLES.SUPER_ADMIN
           ? '/superadmin'
@@ -275,12 +290,15 @@ export const login = async (req, res, next) => {
 
 export const refreshAccessToken = async (req, res, next) => {
   try {
-    const { refreshToken } = req.body;
+    const { refreshToken, expectedUserId } = req.body;
     if (!refreshToken) {
       return res.status(400).json({ success: false, message: 'Refresh token required.' });
     }
 
     const decoded = verifyRefreshToken(refreshToken);
+    if (expectedUserId && String(decoded.id) !== String(expectedUserId)) {
+      return res.status(401).json({ success: false, message: 'Refresh token does not match the authenticated account.' });
+    }
     const user = await User.findById(decoded.id);
 
     if (!user || !user.isActive) {
@@ -307,7 +325,10 @@ export const refreshAccessToken = async (req, res, next) => {
       data: tokens
     });
   } catch (err) {
-    return res.status(401).json({ success: false, message: 'Expired or invalid refresh token.' });
+    if (['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError'].includes(err.name)) {
+      return res.status(401).json({ success: false, message: 'Expired or invalid refresh token.' });
+    }
+    return next(err);
   }
 };
 
@@ -456,4 +477,3 @@ export const resetPassword = async (req, res, next) => {
     next(err);
   }
 };
-

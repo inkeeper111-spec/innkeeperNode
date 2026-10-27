@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { Expense } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
+import { notifyHotelOperations } from '../services/notificationService.js';
 
 export const getExpenses = async (req, res, next) => {
   try {
@@ -78,6 +79,16 @@ export const createExpense = async (req, res, next) => {
       createdBy: req.user._id,
       approvedBy: req.user._id
     });
+    await notifyHotelOperations({
+      hotelId: req.hotelId,
+      title: 'Expense recorded',
+      message: `Expense ${expense.expenseNumber} for ${expense.amount} was recorded.`,
+      module: 'expenses',
+      eventType: 'expense_created',
+      relatedRecordId: expense._id,
+      link: '/expenses',
+      eventId: `expense-created:${expense._id}`
+    });
 
     res.status(201).json({
       success: true,
@@ -102,9 +113,18 @@ export const updateExpenseStatus = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Expense not found.' });
     }
 
+    await notifyHotelOperations({
+      hotelId: req.hotelId,
+      title: 'Expense status updated',
+      message: `Expense ${expense.expenseNumber} is now ${expense.status}.`,
+      module: 'expenses',
+      eventType: 'expense_status_updated',
+      relatedRecordId: expense._id,
+      link: '/expenses',
+      eventId: `expense-status:${expense._id}:${expense.updatedAt?.getTime?.() || Date.now()}`
+    });
     res.json({ success: true, message: `Expense marked as ${status}.`, data: expense });
   } catch (err) {
     next(err);
   }
 };
-

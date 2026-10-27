@@ -33,11 +33,15 @@ export const ROOM_STATUS = {
 export const HOUSEKEEPING_STATUS = {
   CLEAN: 'clean',
   DIRTY: 'dirty',
+  REJECTED: 'rejected',
   CLEANING_IN_PROGRESS: 'cleaning_in_progress',
   INSPECTED: 'inspected'
 };
 
 export const RESERVATION_STATUS = {
+  PENDING_APPROVAL: 'pending_approval',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
   PENDING: 'pending',
   CONFIRMED: 'confirmed',
   CHECKED_IN: 'checked_in',
@@ -82,6 +86,7 @@ export const FOOD_ORDER_STATUS = {
 export const MAINTENANCE_STATUS = {
   OPEN: 'open',
   ASSIGNED: 'assigned',
+  REJECTED: 'rejected',
   IN_PROGRESS: 'in_progress',
   ON_HOLD: 'on_hold',
   RESOLVED: 'resolved',
@@ -94,4 +99,3 @@ export const PRIORITY = {
   HIGH: 'high',
   CRITICAL: 'critical'
 };
-

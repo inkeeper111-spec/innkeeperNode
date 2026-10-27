@@ -33,7 +33,52 @@ export const updateHotelProfile = async (req, res, next) => {
       }
     }
 
-    const hotel = await Hotel.findByIdAndUpdate(req.hotelId, updates, { new: true });
+    if (req.body.attendanceLocation !== undefined) {
+      if (
+        req.body.attendanceLocation !== null
+        && (typeof req.body.attendanceLocation !== 'object' || Array.isArray(req.body.attendanceLocation))
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: 'Attendance location must contain latitude and longitude coordinates.'
+        });
+      }
+      const { latitude, longitude } = req.body.attendanceLocation || {};
+      const latitudeEmpty = latitude === '' || latitude === null || latitude === undefined;
+      const longitudeEmpty = longitude === '' || longitude === null || longitude === undefined;
+
+      if (latitudeEmpty && longitudeEmpty) {
+        updates.attendanceLocation = null;
+      } else {
+        const parsedLatitude = Number(latitude);
+        const parsedLongitude = Number(longitude);
+        if (
+          latitudeEmpty
+          || longitudeEmpty
+          || !Number.isFinite(parsedLatitude)
+          || parsedLatitude < -90
+          || parsedLatitude > 90
+          || !Number.isFinite(parsedLongitude)
+          || parsedLongitude < -180
+          || parsedLongitude > 180
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: 'Enter valid hotel latitude and longitude coordinates.'
+          });
+        }
+
+        updates.attendanceLocation = {
+          latitude: parsedLatitude,
+          longitude: parsedLongitude
+        };
+      }
+    }
+
+    const hotel = await Hotel.findByIdAndUpdate(req.hotelId, updates, {
+      new: true,
+      runValidators: true
+    });
 
     await logAudit({
       hotelId: req.hotelId,
@@ -106,4 +151,3 @@ export const updateProperty = async (req, res, next) => {
     next(err);
   }
 };
-

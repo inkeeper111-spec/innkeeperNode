@@ -1,8 +1,9 @@
-import { Invoice, Payment, Reservation, Refund, Notification } from '../models/index.js';
+import { Invoice, Payment, Reservation, Refund } from '../models/index.js';
 import { INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_METHODS } from '../config/constants.js';
 import { createRazorpayOrder, verifyRazorpayPayment, verifyWebhookSignature, processRazorpayRefund } from '../services/razorpayService.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
+import { notifyRoles } from '../services/notificationService.js';
 
 export const getInvoices = async (req, res, next) => {
   try {
@@ -431,12 +432,17 @@ export const razorpayWebhook = async (req, res, next) => {
       if (invoiceId) {
         const invoice = await Invoice.findById(invoiceId);
         if (invoice) {
-          await Notification.create({
+          await notifyRoles({
             hotelId: invoice.hotelId,
+            roles: ['hotel_admin', 'receptionist'],
             title: 'Payment Failed',
-            message: `Razorpay payment failed for Invoice ${invoice.invoiceNumber}. Amount: $${paymentEntity.amount / 100}.`,
-            type: 'billing',
-            link: '/billing'
+            message: `A payment for invoice ${invoice.invoiceNumber} failed.`,
+            module: 'payments',
+            eventType: 'payment_failed',
+            relatedRecordId: invoice._id,
+            priority: 'high',
+            link: '/billing',
+            eventId: `payment-failed:${paymentEntity.id || event.id || invoice._id}`
           });
         }
       }

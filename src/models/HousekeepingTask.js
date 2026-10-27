@@ -25,6 +25,30 @@ const housekeepingTaskSchema = new mongoose.Schema({
     ref: 'User',
     default: null
   },
+  assignedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  assignedAt: Date,
+  assignmentStatus: {
+    type: String,
+    enum: ['pending', 'accepted', 'rejected'],
+    default: 'pending'
+  },
+  acceptedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  acceptedAt: Date,
+  rejectionReason: { type: String, default: '' },
+  rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  rejectedAt: Date,
+  assignmentHistory: [{
+    action: { type: String, enum: ['assigned', 'accepted', 'rejected', 'reassigned'], required: true },
+    actorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    previousAssignee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    timestamp: { type: Date, required: true },
+    reason: { type: String, default: '' }
+  }],
   priority: {
     type: String,
     enum: Object.values(PRIORITY),
@@ -58,8 +82,8 @@ const housekeepingTaskSchema = new mongoose.Schema({
   },
   inspectedAt: Date
 }, {
-  timestamps: true
+  timestamps: true,
+  optimisticConcurrency: true
 });
 
 export const HousekeepingTask = mongoose.models.HousekeepingTask || mongoose.model('HousekeepingTask', housekeepingTaskSchema);
-

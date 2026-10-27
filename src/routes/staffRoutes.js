@@ -17,9 +17,6 @@ import {
   checkIn,
   checkOut,
   getMyAttendance,
-  getLeaves,
-  createLeave,
-  reviewLeave,
   getAdvances,
   createAdvance,
   exportSalaryCsv
@@ -50,10 +47,6 @@ router.get('/attendance/me', getMyAttendance);
 router.get('/attendance',         getAttendance);
 router.post('/attendance',        authorize(ROLES.HOTEL_ADMIN), recordAttendance);
 router.patch('/attendance/:id',   authorize(ROLES.HOTEL_ADMIN), updateAttendance);
-
-router.get('/leave', getLeaves);
-router.post('/leave', createLeave);
-router.patch('/leave/:id', authorize(ROLES.HOTEL_ADMIN), reviewLeave);
 
 router.get('/advances', authorize(ROLES.HOTEL_ADMIN), getAdvances);
 router.post('/advances', authorize(ROLES.HOTEL_ADMIN), createAdvance);

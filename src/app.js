@@ -16,6 +16,7 @@ import restaurantRoutes from './routes/restaurantRoutes.js';
 import inventoryRoutes from './routes/inventoryRoutes.js';
 import expenseRoutes from './routes/expenseRoutes.js';
 import staffRoutes from './routes/staffRoutes.js';
+import leaveRoutes from './routes/leaveRoutes.js';
 import maintenanceRoutes from './routes/maintenanceRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
@@ -66,6 +67,7 @@ app.use('/api/v1/restaurant', restaurantRoutes);
 app.use('/api/v1/inventory', inventoryRoutes);
 app.use('/api/v1/expenses', expenseRoutes);
 app.use('/api/v1/staff', staffRoutes);
+app.use('/api/v1/leave', leaveRoutes);
 app.use('/api/v1/maintenance', maintenanceRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
@@ -81,4 +83,3 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 export default app;
-

@@ -58,6 +58,16 @@ const foodOrderSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  tableId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'RestaurantTable',
+    default: null,
+    index: true
+  },
+  tableNameSnapshot: {
+    type: String,
+    default: ''
+  },
   roomId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Room'
@@ -120,4 +130,3 @@ const foodOrderSchema = new mongoose.Schema({
 });
 
 export const FoodOrder = mongoose.models.FoodOrder || mongoose.model('FoodOrder', foodOrderSchema);
-

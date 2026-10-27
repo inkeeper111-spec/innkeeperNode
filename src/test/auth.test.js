@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import app from '../app.js';
+import { User } from '../models/index.js';
 import { setup, teardown } from './setup.js';
 
 beforeAll(async () => { await setup(); });
@@ -42,6 +43,38 @@ describe('POST /api/v1/auth/register', () => {
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 describe('POST /api/v1/auth/login', () => {
+  it('should reject guest accounts from the staff portal', async () => {
+    const hotelAdmin = await User.findOne({ email: HOTEL_PAYLOAD.email });
+    await User.create({
+      name: 'Guest Account',
+      email: 'guest-login@example.com',
+      password: 'GuestPassword123!',
+      role: 'guest',
+      hotelId: hotelAdmin.hotelId,
+      propertyId: hotelAdmin.propertyId,
+      isActive: true
+    });
+
+    const login = await request(app).post('/api/v1/auth/login').send({
+      email: 'guest-login@example.com',
+      password: 'GuestPassword123!'
+    });
+    const staffLogin = await request(app).post('/api/v1/auth/login').send({
+      email: 'guest-login@example.com',
+      password: 'GuestPassword123!',
+      portal: 'staff'
+    });
+
+    expect(staffLogin.status).toBe(403);
+    expect(staffLogin.body.message).toMatch(/guest accounts cannot sign in/i);
+
+    const staffApi = await request(app)
+      .get('/api/v1/rooms')
+      .set('Authorization', ['Bearer', login.body.data.accessToken].join(' '));
+    expect(staffApi.status).toBe(403);
+    expect(staffApi.body.message).toMatch(/guest accounts cannot access staff operations/i);
+  });
+
   it('should login with valid credentials and return tokens', async () => {
     const res = await request(app).post('/api/v1/auth/login').send({
       email:    HOTEL_PAYLOAD.email,
@@ -98,6 +131,34 @@ describe('GET /api/v1/auth/me', () => {
 
 // ─── Token Refresh ────────────────────────────────────────────────────────────
 describe('POST /api/v1/auth/refresh', () => {
+  it('should not rotate a refresh token that belongs to a different account during migration', async () => {
+    const guest = await User.create({
+      name: 'Refresh Migration Guest',
+      email: 'refresh-guest@example.com',
+      password: 'GuestPassword123!',
+      role: 'guest',
+      isActive: true
+    });
+    const guestLogin = await request(app).post('/api/v1/auth/login').send({
+      email: guest.email,
+      password: 'GuestPassword123!'
+    });
+    const staffLogin = await request(app).post('/api/v1/auth/login').send({
+      email: HOTEL_PAYLOAD.email,
+      password: HOTEL_PAYLOAD.password
+    });
+    const refreshToken = guestLogin.body.data.refreshToken;
+
+    const mismatched = await request(app).post('/api/v1/auth/refresh').send({
+      refreshToken,
+      expectedUserId: staffLogin.body.data.user.id
+    });
+    expect(mismatched.status).toBe(401);
+
+    const valid = await request(app).post('/api/v1/auth/refresh').send({ refreshToken });
+    expect(valid.status).toBe(200);
+  });
+
   it('should return new tokens with valid refresh token', async () => {
     const loginRes = await request(app).post('/api/v1/auth/login').send({
       email:    HOTEL_PAYLOAD.email,

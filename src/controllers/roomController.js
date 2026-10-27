@@ -1,6 +1,7 @@
 import dayjs from 'dayjs';
 import { Room, RoomType, Property, Reservation } from '../models/index.js';
 import { ROOM_STATUS, HOUSEKEEPING_STATUS, RESERVATION_STATUS } from '../config/constants.js';
+import { notifyRoles } from '../services/notificationService.js';
 
 export const getRooms = async (req, res, next) => {
   try {
@@ -60,6 +61,17 @@ export const createRoom = async (req, res, next) => {
     });
 
     const populatedRoom = await Room.findById(room._id).populate('roomTypeId', 'name code basePrice');
+    await notifyRoles({
+      hotelId: req.hotelId,
+      roles: ['hotel_admin'],
+      title: 'Room added',
+      message: `Room ${room.roomNumber} was added to the property.`,
+      module: 'rooms',
+      eventType: 'room_created',
+      relatedRecordId: room._id,
+      link: '/rooms',
+      eventId: `room-created:${room._id}`
+    });
 
     res.status(201).json({
       success: true,
@@ -99,6 +111,17 @@ export const updateRoom = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Room not found.' });
     }
 
+    await notifyRoles({
+      hotelId: req.hotelId,
+      roles: ['hotel_admin'],
+      title: 'Room updated',
+      message: `Room ${room.roomNumber} details were updated.`,
+      module: 'rooms',
+      eventType: 'room_updated',
+      relatedRecordId: room._id,
+      link: '/rooms',
+      eventId: `room-updated:${room._id}:${room.updatedAt?.getTime?.() || Date.now()}`
+    });
     res.json({ success: true, message: 'Room updated.', data: room });
   } catch (err) {
     next(err);
@@ -124,6 +147,20 @@ export const updateRoomStatus = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Room not found.' });
     }
 
+    if (roomStatus || housekeepingStatus || maintenanceStatus) {
+      await notifyRoles({
+        hotelId: req.hotelId,
+        roles: ['hotel_admin', 'receptionist'],
+        title: 'Room status changed',
+        message: `Room ${room.roomNumber} status is now ${room.roomStatus.replace(/_/g, ' ')}.`,
+        module: 'rooms',
+        eventType: 'room_status_changed',
+        relatedRecordId: room._id,
+        priority: room.roomStatus === ROOM_STATUS.OUT_OF_SERVICE ? 'high' : 'medium',
+        link: '/rooms',
+        eventId: `room-status:${room._id}:${room.updatedAt?.getTime?.() || Date.now()}`
+      });
+    }
     res.json({ success: true, message: 'Room status updated.', data: room });
   } catch (err) {
     next(err);
@@ -158,7 +195,7 @@ export const checkAvailability = async (req, res, next) => {
     // Overlap condition: (existingCheckIn < requestedCheckOut) AND (existingCheckOut > requestedCheckIn)
     const overlappingReservations = await Reservation.find({
       hotelId: req.hotelId,
-      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
+      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.PENDING_APPROVAL, RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
       checkInDate: { $lt: end },
       checkOutDate: { $gt: start }
     }).select('rooms.roomId');
@@ -200,4 +237,3 @@ export const checkAvailability = async (req, res, next) => {
     next(err);
   }
 };
-

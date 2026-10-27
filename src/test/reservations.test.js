@@ -5,6 +5,8 @@ import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
 
 let adminToken  = '';
+let receptionistToken = '';
+let restaurantToken = '';
 let hotelId     = '';
 let roomId      = '';
 let roomTypeId  = '';
@@ -21,6 +23,18 @@ beforeAll(async () => {
   });
   adminToken = loginRes.body.data.accessToken;
   hotelId    = loginRes.body.data.user.hotelId;
+
+  const receptionistLogin = await request(app).post('/api/v1/auth/login').send({
+    email: 'reception@grandregal.com',
+    password: 'StaffPassword123!'
+  });
+  receptionistToken = receptionistLogin.body.data.accessToken;
+
+  const restaurantLogin = await request(app).post('/api/v1/auth/login').send({
+    email: 'chef@grandregal.com',
+    password: 'StaffPassword123!'
+  });
+  restaurantToken = restaurantLogin.body.data.accessToken;
 
   // Get an available room
   const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 5);
@@ -231,5 +245,112 @@ describe('POST /api/v1/reservations/:id/cancel', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('cancelled');
+  });
+});
+
+describe('Reservation request approval workflow', () => {
+  const createRequest = async (daysFromNow, email) => {
+    const checkIn = new Date();
+    checkIn.setDate(checkIn.getDate() + daysFromNow);
+    const checkOut = new Date(checkIn);
+    checkOut.setDate(checkOut.getDate() + 2);
+
+    return request(app).post('/api/v1/public/bookings').send({
+      hotelId,
+      guestName: 'Reservation Request Guest',
+      guestEmail: email,
+      guestPhone: '+1 555 222 3344',
+      checkInDate: checkIn.toISOString().slice(0, 10),
+      checkOutDate: checkOut.toISOString().slice(0, 10),
+      roomTypeId,
+      adultsCount: 1
+    });
+  };
+
+  it('creates public bookings as pending approval and restricts request access by role', async () => {
+    const created = await createRequest(365, 'pending.request@example.com');
+    expect(created.status).toBe(201);
+    expect(created.body.data.reservation.status).toBe('pending_approval');
+
+    const guestLookup = await request(app)
+      .get(`/api/v1/public/bookings/lookup?reference=${created.body.data.bookingReference}&email=pending.request@example.com`);
+    expect(guestLookup.status).toBe(200);
+    expect(guestLookup.body.data.reservation.status).toBe('pending_approval');
+
+    const invalidGuestLookup = await request(app)
+      .get(`/api/v1/public/bookings/lookup?reference=${created.body.data.bookingReference}&email=other@example.com`);
+    expect(invalidGuestLookup.status).toBe(404);
+
+    const requests = await request(app)
+      .get('/api/v1/reservations/requests')
+      .set('Authorization', `Bearer ${receptionistToken}`);
+    expect(requests.status).toBe(200);
+    expect(requests.body.data.reservations.some(
+      (reservation) => reservation._id === created.body.data.reservation._id
+    )).toBe(true);
+
+    const forbidden = await request(app)
+      .get('/api/v1/reservations/requests')
+      .set('Authorization', `Bearer ${restaurantToken}`);
+    expect(forbidden.status).toBe(403);
+
+    const hiddenFromList = await request(app)
+      .get('/api/v1/reservations?status=pending_approval')
+      .set('Authorization', `Bearer ${restaurantToken}`);
+    expect(hiddenFromList.status).toBe(403);
+
+    const hiddenDetails = await request(app)
+      .get(`/api/v1/reservations/${created.body.data.reservation._id}`)
+      .set('Authorization', `Bearer ${restaurantToken}`);
+    expect(hiddenDetails.status).toBe(403);
+  });
+
+  it('allows an authorized hotel admin to approve once and records the actor', async () => {
+    const created = await createRequest(370, 'approve.request@example.com');
+    const id = created.body.data.reservation._id;
+
+    const approved = await request(app)
+      .post(`/api/v1/reservations/${id}/approve`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(approved.status).toBe(200);
+    expect(approved.body.data.status).toBe('approved');
+    expect(approved.body.data.approvedByRole).toBe('hotel_admin');
+    expect(approved.body.data.approvedAt).toBeTruthy();
+
+    const duplicate = await request(app)
+      .post(`/api/v1/reservations/${id}/approve`)
+      .set('Authorization', `Bearer ${receptionistToken}`);
+    expect(duplicate.status).toBe(409);
+  });
+
+  it('requires a rejection reason and allows a receptionist to reject', async () => {
+    const created = await createRequest(375, 'reject.request@example.com');
+    const id = created.body.data.reservation._id;
+
+    const emptyReason = await request(app)
+      .post(`/api/v1/reservations/${id}/reject`)
+      .set('Authorization', `Bearer ${receptionistToken}`)
+      .send({ reason: '   ' });
+    expect(emptyReason.status).toBe(400);
+
+    const rejected = await request(app)
+      .post(`/api/v1/reservations/${id}/reject`)
+      .set('Authorization', `Bearer ${receptionistToken}`)
+      .send({ reason: 'Room unavailable for requested dates.' });
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.data.status).toBe('rejected');
+    expect(rejected.body.data.rejectionReason).toBe('Room unavailable for requested dates.');
+    expect(rejected.body.data.rejectedByRole).toBe('receptionist');
+
+    const guestLookup = await request(app)
+      .get(`/api/v1/public/bookings/lookup?reference=${created.body.data.bookingReference}&email=reject.request@example.com`);
+    expect(guestLookup.status).toBe(200);
+    expect(guestLookup.body.data.reservation.status).toBe('rejected');
+    expect(guestLookup.body.data.reservation.rejectionReason).toBe('Room unavailable for requested dates.');
+
+    const duplicate = await request(app)
+      .post(`/api/v1/reservations/${id}/approve`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(duplicate.status).toBe(409);
   });
 });

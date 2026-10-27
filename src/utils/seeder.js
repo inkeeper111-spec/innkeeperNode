@@ -5,7 +5,7 @@ import {
   RoomType, Room, Guest, Reservation, Invoice, Payment,
   HousekeepingTask, MenuCategory, MenuItem, FoodOrder,
   InventoryItem, StockMovement, Vendor, Expense,
-  StaffProfile, Shift, Attendance, MaintenanceTicket, Notification
+  StaffProfile, Shift, Attendance, AttendanceLocationAudit, MaintenanceTicket, Notification
 } from '../models/index.js';
 import {
   ROLES, HOTEL_STATUS, SUBSCRIPTION_STATUS,
@@ -42,6 +42,7 @@ export const seedDatabase = async () => {
     StaffProfile.deleteMany({}),
     Shift.deleteMany({}),
     Attendance.deleteMany({}),
+    AttendanceLocationAudit.deleteMany({}),
     MaintenanceTicket.deleteMany({}),
     Notification.deleteMany({})
   ]);
@@ -739,4 +740,3 @@ if (process.argv[1]?.endsWith('seeder.js')) {
     }
   })();
 }
-

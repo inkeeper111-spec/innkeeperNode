@@ -13,6 +13,12 @@ const notificationSchema = new mongoose.Schema({
     default: null,
     index: true
   },
+  recipientId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+    index: true
+  },
   recipientRole: {
     type: String,
     default: ''
@@ -27,13 +33,42 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['booking', 'payment', 'housekeeping', 'maintenance', 'inventory', 'system'],
     default: 'system'
+  },
+  module: {
+    type: String,
+    default: 'system',
+    trim: true,
+    index: true
+  },
+  eventType: {
+    type: String,
+    default: '',
+    trim: true
+  },
+  relatedRecordId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: null
+  },
+  priority: {
+    type: String,
+    enum: ['critical', 'high', 'medium', 'low'],
+    default: 'medium',
+    index: true
+  },
+  eventId: {
+    type: String,
+    default: '',
+    select: false
   },
   isRead: {
     type: Boolean,
     default: false,
     index: true
+  },
+  readAt: {
+    type: Date,
+    default: null
   },
   link: {
     type: String,
@@ -43,5 +78,7 @@ const notificationSchema = new mongoose.Schema({
   timestamps: true
 });
 
-export const Notification = mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
+notificationSchema.index({ eventId: 1 }, { unique: true, partialFilterExpression: { eventId: { $type: 'string', $gt: '' } } });
+notificationSchema.index({ recipientId: 1, hotelId: 1, createdAt: -1 });
 
+export const Notification = mongoose.models.Notification || mongoose.model('Notification', notificationSchema);

@@ -106,7 +106,7 @@ export const searchPublicRooms = async (req, res, next) => {
     // Find active overlapping reservations
     const overlapping = await Reservation.find({
       hotelId,
-      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
+      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.PENDING_APPROVAL, RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
       checkInDate: { $lt: end },
       checkOutDate: { $gt: start }
     }).select('rooms.roomId');
@@ -195,7 +195,7 @@ export const bookPublicReservation = async (req, res, next) => {
     // Find an available room of this type
     const overlapping = await Reservation.find({
       hotelId,
-      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
+      status: { $in: [RESERVATION_STATUS.PENDING, RESERVATION_STATUS.PENDING_APPROVAL, RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.CHECKED_IN] },
       checkInDate: { $lt: end },
       checkOutDate: { $gt: start }
     }).select('rooms.roomId');
@@ -249,7 +249,7 @@ export const bookPublicReservation = async (req, res, next) => {
       adultsCount,
       childrenCount,
       bookingSource: 'online',
-      status: RESERVATION_STATUS.CONFIRMED,
+      status: RESERVATION_STATUS.PENDING_APPROVAL,
       paymentStatus: PAYMENT_STATUS.UNPAID,
       subtotal,
       taxAmount,
@@ -284,7 +284,7 @@ export const bookPublicReservation = async (req, res, next) => {
 
     res.status(201).json({
       success: true,
-      message: 'Booking confirmed successfully!',
+      message: 'Reservation request submitted successfully. It is awaiting approval from the hotel team.',
       data: {
         bookingReference,
         reservation,
@@ -327,4 +327,3 @@ export const lookupPublicReservation = async (req, res, next) => {
     next(err);
   }
 };
-

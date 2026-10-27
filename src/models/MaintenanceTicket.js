@@ -57,6 +57,30 @@ const maintenanceTicketSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  assignedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  assignedAt: Date,
+  assignmentStatus: {
+    type: String,
+    enum: ['pending', 'accepted', 'rejected'],
+    default: 'pending'
+  },
+  acceptedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  acceptedAt: Date,
+  rejectionReason: { type: String, default: '' },
+  rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  rejectedAt: Date,
+  assignmentHistory: [{
+    action: { type: String, enum: ['assigned', 'accepted', 'rejected', 'reassigned'], required: true },
+    actorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    previousAssignee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    timestamp: { type: Date, required: true },
+    reason: { type: String, default: '' }
+  }],
   technicianName: String,
   estimatedCost: {
     type: Number,
@@ -81,8 +105,8 @@ const maintenanceTicketSchema = new mongoose.Schema({
   resolvedAt: Date,
   closedAt: Date
 }, {
-  timestamps: true
+  timestamps: true,
+  optimisticConcurrency: true
 });
 
 export const MaintenanceTicket = mongoose.models.MaintenanceTicket || mongoose.model('MaintenanceTicket', maintenanceTicketSchema);
-

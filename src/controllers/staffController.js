@@ -1,5 +1,14 @@
 import dayjs from 'dayjs';
-import { User, StaffProfile, Shift, Attendance, SalaryRecord, Expense, LeaveRequest, SalaryAdvance } from '../models/index.js';
+import {
+  User, StaffProfile, Shift, Attendance, AttendanceLocationAudit,
+  SalaryRecord, Expense, LeaveRequest, SalaryAdvance, Hotel
+} from '../models/index.js';
+import { getLeaveAttendanceForDate } from './leaveController.js';
+import { ROLES } from '../config/constants.js';
+import { generateReference } from '../utils/reference.js';
+import { logAudit } from '../services/auditService.js';
+import { notifyHotelOperations } from '../services/notificationService.js';
+import { validateAttendanceLocation } from '../services/attendanceGeofenceService.js';
 
 const calcHours = (checkInTime, checkOutTime) => {
   if (!checkInTime || !checkOutTime) return 0;
@@ -10,9 +19,39 @@ const calcHours = (checkInTime, checkOutTime) => {
 };
 
 const nowTime = () => dayjs().format('HH:mm');
-import { ROLES } from '../config/constants.js';
-import { generateReference } from '../utils/reference.js';
-import { logAudit } from '../services/auditService.js';
+
+const getLeaveAdjustedAttendanceCounts = async (hotelId, userId, records, start, end) => {
+  let absent = records.filter((record) => record.status === 'absent').length;
+  let onLeave = records.filter((record) => record.status === 'on_leave').length;
+  const recordsByDate = new Map(records.map((record) => [dayjs(record.date).format('YYYY-MM-DD'), record]));
+  const leaveRequests = await LeaveRequest.find({
+    hotelId,
+    userId,
+    status: 'approved',
+    startDate: { $lte: end },
+    endDate: { $gte: start }
+  }).select('startDate endDate').lean();
+  const approvedDates = new Set();
+
+  for (const leave of leaveRequests) {
+    let date = dayjs(leave.startDate).isBefore(start, 'day') ? dayjs(start) : dayjs(leave.startDate);
+    const lastDate = dayjs(leave.endDate).isAfter(end, 'day') ? dayjs(end) : dayjs(leave.endDate);
+    while (!date.isAfter(lastDate, 'day')) {
+      approvedDates.add(date.format('YYYY-MM-DD'));
+      date = date.add(1, 'day');
+    }
+  }
+
+  for (const date of approvedDates) {
+    const record = recordsByDate.get(date);
+    if (record && ['present', 'late', 'half_day'].includes(record.status)) continue;
+    if (record?.status === 'on_leave') continue;
+    if (record?.status === 'absent') absent -= 1;
+    onLeave += 1;
+  }
+
+  return { absent, onLeave };
+};
 
 // ─── Staff Directory ───────────────────────────────────────────────────────────
 export const getStaff = async (req, res, next) => {
@@ -110,6 +149,16 @@ export const createStaff = async (req, res, next) => {
       details: { name, employeeId: profile.employeeId, department },
       req
     });
+    await notifyHotelOperations({
+      hotelId: req.hotelId,
+      title: 'Employee onboarded',
+      message: 'A new employee was added to the hotel team.',
+      module: 'staff',
+      eventType: 'employee_created',
+      relatedRecordId: profile._id,
+      link: '/staff',
+      eventId: `employee-created:${profile._id}`
+    });
 
     res.status(201).json({
       success: true,
@@ -204,7 +253,7 @@ export const getAttendance = async (req, res, next) => {
     const filter = { hotelId: req.hotelId };
 
     if (userId)  filter.userId = userId;
-    if (status && status !== 'all') filter.status = status;
+    if (status && status !== 'all' && status !== 'on_leave') filter.status = status;
     if (startDate && endDate) {
       filter.date = {
         $gte: dayjs(startDate).startOf('day').toDate(),
@@ -219,10 +268,60 @@ export const getAttendance = async (req, res, next) => {
       .sort({ date: -1 })
       .skip(skip)
       .limit(parseInt(limit));
+    const rangeStart = startDate || records.at(-1)?.date || new Date();
+    const rangeEnd = endDate || records[0]?.date || rangeStart;
+    const leaveFilter = {
+      hotelId: req.hotelId,
+      status: 'approved',
+      startDate: { $lte: dayjs(rangeEnd).endOf('day').toDate() },
+      endDate: { $gte: dayjs(rangeStart).startOf('day').toDate() }
+    };
+    if (userId) leaveFilter.userId = userId;
+    const approvedLeaves = await LeaveRequest.find(leaveFilter)
+      .populate('userId', 'name email role')
+      .lean();
+    const attendanceByDate = new Map(records.map((record) => [
+      `${String(record.userId?._id || record.userId)}:${dayjs(record.date).format('YYYY-MM-DD')}`,
+      record
+    ]));
+    for (const leave of approvedLeaves) {
+      let date = dayjs(leave.startDate).isBefore(rangeStart, 'day') ? dayjs(rangeStart) : dayjs(leave.startDate);
+      const lastDate = dayjs(leave.endDate).isAfter(rangeEnd, 'day') ? dayjs(rangeEnd) : dayjs(leave.endDate);
+      while (!date.isAfter(lastDate, 'day')) {
+        const key = `${String(leave.userId?._id)}:${date.format('YYYY-MM-DD')}`;
+        const existing = attendanceByDate.get(key);
+        if (existing && !['absent', 'on_leave'].includes(existing.status)) {
+          date = date.add(1, 'day');
+          continue;
+        }
+        attendanceByDate.set(key, {
+          ...(existing?.toObject ? existing.toObject() : existing || {}),
+          _id: existing?._id || `leave-${key}`,
+          userId: leave.userId,
+          date: date.toDate(),
+          checkInTime: '',
+          checkOutTime: '',
+          workingHours: 0,
+          status: 'on_leave',
+          notes: `Approved leave: ${leave.leaveType}`
+        });
+        date = date.add(1, 'day');
+      }
+    }
+    const attendanceWithLeave = [...attendanceByDate.values()]
+      .filter((record) => !status || status === 'all' || record.status === status)
+      .sort((a, b) => dayjs(b.date).valueOf() - dayjs(a.date).valueOf());
 
     res.json({
       success: true,
-      data: { attendance: records, pagination: { total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) } }
+      data: {
+        attendance: attendanceWithLeave,
+        pagination: {
+          total: status === 'on_leave' ? attendanceWithLeave.length : total,
+          page: parseInt(page),
+          pages: Math.ceil((status === 'on_leave' ? attendanceWithLeave.length : total) / parseInt(limit))
+        }
+      }
     });
   } catch (err) {
     next(err);
@@ -239,6 +338,24 @@ export const recordAttendance = async (req, res, next) => {
     }
 
     const attendanceDate = dayjs(date || new Date()).startOf('day').toDate();
+    const approvedLeave = await getLeaveAttendanceForDate(req.hotelId, [attendanceUserId], attendanceDate);
+    const leaveType = approvedLeave.get(String(attendanceUserId));
+    if (leaveType) {
+      return res.status(200).json({
+        success: true,
+        message: 'Attendance is represented as approved leave for this date.',
+        data: {
+          userId: attendanceUserId,
+          date: attendanceDate,
+          checkInTime: '',
+          checkOutTime: '',
+          workingHours: 0,
+          status: 'on_leave',
+          notes: `Approved leave: ${leaveType}`
+        }
+      });
+    }
+    const attendanceStatus = status || 'present';
 
     // Upsert — if record for this user+date already exists, update it
     const record = await Attendance.findOneAndUpdate(
@@ -250,12 +367,20 @@ export const recordAttendance = async (req, res, next) => {
         checkInTime:  checkInTime  || '09:00',
         checkOutTime: checkOutTime || '',
         workingHours: calcHours(checkInTime || '09:00', checkOutTime || ''),
-        status:  status  || 'present',
-        notes:   notes   || ''
+        status:  attendanceStatus,
+        notes:   notes || ''
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'RECORD_ATTENDANCE',
+      entity: 'Attendance',
+      entityId: record._id,
+      details: { userId: String(attendanceUserId), date: attendanceDate, status: attendanceStatus },
+      req
+    });
     res.status(201).json({ success: true, data: record });
   } catch (err) {
     next(err);
@@ -264,13 +389,33 @@ export const recordAttendance = async (req, res, next) => {
 
 export const updateAttendance = async (req, res, next) => {
   try {
+    const existing = await Attendance.findOne({ _id: req.params.id, hotelId: req.hotelId });
+    if (!existing) return res.status(404).json({ success: false, message: 'Attendance record not found.' });
+
+    const approvedLeave = await getLeaveAttendanceForDate(req.hotelId, [existing.userId], existing.date);
+    const leaveType = approvedLeave.get(String(existing.userId));
+    if (leaveType) {
+      return res.status(409).json({
+        success: false,
+        message: 'Attendance cannot be edited while approved leave covers this date.'
+      });
+    }
+    const updates = { ...req.body };
+
     const record = await Attendance.findOneAndUpdate(
       { _id: req.params.id, hotelId: req.hotelId },
-      req.body,
-      { new: true }
+      { $set: updates },
+      { new: true, runValidators: true }
     ).populate('userId', 'name email');
 
-    if (!record) return res.status(404).json({ success: false, message: 'Attendance record not found.' });
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'UPDATE_ATTENDANCE',
+      entity: 'Attendance',
+      entityId: record._id,
+      details: { changes: updates },
+      req
+    });
     res.json({ success: true, data: record });
   } catch (err) {
     next(err);
@@ -288,8 +433,16 @@ export const bulkMarkAttendance = async (req, res, next) => {
     const attendanceDate = dayjs(date || new Date()).startOf('day').toDate();
 
     if (records && records.length > 0) {
+      const approvedLeave = await getLeaveAttendanceForDate(
+        req.hotelId,
+        records.map((record) => record.userId),
+        attendanceDate
+      );
       // Upsert each provided record
-      const ops = records.map((r) => ({
+      const ops = records.map((r) => {
+        const leaveType = approvedLeave.get(String(r.userId));
+        if (leaveType) return null;
+        return {
         updateOne: {
           filter: { hotelId: req.hotelId, userId: r.userId, date: attendanceDate },
           update: {
@@ -299,29 +452,53 @@ export const bulkMarkAttendance = async (req, res, next) => {
               date:         attendanceDate,
               checkInTime:  r.checkInTime  || '09:00',
               checkOutTime: r.checkOutTime || '',
-              status:       r.status       || defaultStatus,
-              notes:        r.notes        || ''
+              status:       r.status || defaultStatus,
+              notes:        r.notes || ''
             }
           },
           upsert: true
         }
-      }));
-      await Attendance.bulkWrite(ops);
+      };
+      }).filter(Boolean);
+      if (ops.length) await Attendance.bulkWrite(ops);
     } else {
       // Mark ALL active staff as defaultStatus for the given date
       const allStaff = await StaffProfile.find({ hotelId: req.hotelId, status: 'active' });
-      const ops = allStaff.map((s) => ({
+      const approvedLeave = await getLeaveAttendanceForDate(
+        req.hotelId,
+        allStaff.map((staff) => staff.userId),
+        attendanceDate
+      );
+      const ops = allStaff.map((s) => {
+        const leaveType = approvedLeave.get(String(s.userId));
+        if (leaveType) return null;
+        return {
         updateOne: {
           filter: { hotelId: req.hotelId, userId: s.userId, date: attendanceDate },
           update: {
-            $set: { hotelId: req.hotelId, userId: s.userId, date: attendanceDate, checkInTime: '09:00', status: defaultStatus }
+            $set: {
+              hotelId: req.hotelId,
+              userId: s.userId,
+              date: attendanceDate,
+              checkInTime: '09:00',
+              status: defaultStatus,
+              notes: ''
+            }
           },
           upsert: true
         }
-      }));
+      };
+      }).filter(Boolean);
       if (ops.length > 0) await Attendance.bulkWrite(ops);
     }
 
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'BULK_MARK_ATTENDANCE',
+      entity: 'Attendance',
+      details: { date: attendanceDate, count: records?.length || 0, defaultStatus },
+      req
+    });
     res.json({ success: true, message: `Attendance marked for ${dayjs(attendanceDate).format('MMMM D, YYYY')}.` });
   } catch (err) {
     next(err);
@@ -351,10 +528,15 @@ export const getAttendanceSummary = async (req, res, next) => {
         });
 
         const present  = records.filter((r) => r.status === 'present').length;
-        const absent   = records.filter((r) => r.status === 'absent').length;
+        const { absent, onLeave } = await getLeaveAdjustedAttendanceCounts(
+          req.hotelId,
+          s.userId._id,
+          records,
+          start,
+          end
+        );
         const halfDay  = records.filter((r) => r.status === 'half_day').length;
         const late     = records.filter((r) => r.status === 'late').length;
-        const onLeave  = records.filter((r) => r.status === 'on_leave').length;
         const totalHours = records.reduce((sum, r) => sum + (r.workingHours || 0), 0);
         const basic = Number(s.basicSalary || s.salary || 0);
         const allowancesAmt = Number(s.allowances || 0);
@@ -494,10 +676,15 @@ export const processSalary = async (req, res, next) => {
       });
 
       const present  = records.filter((r) => r.status === 'present').length;
-      const absent   = records.filter((r) => r.status === 'absent').length;
+      const { absent, onLeave } = await getLeaveAdjustedAttendanceCounts(
+        req.hotelId,
+        profile.userId._id,
+        records,
+        start,
+        end
+      );
       const halfDay  = records.filter((r) => r.status === 'half_day').length;
       const late     = records.filter((r) => r.status === 'late').length;
-      const onLeave  = records.filter((r) => r.status === 'on_leave').length;
       const totalHours = records.reduce((sum, r) => sum + (r.workingHours || 0), 0);
 
       const basic = Number(profile.basicSalary || profile.salary || 0);
@@ -590,6 +777,18 @@ export const processSalary = async (req, res, next) => {
       details:  { month: targetMonth, processedCount: processed.length, skippedCount: skipped.length },
       req
     });
+    if (processed.length > 0) {
+      await notifyHotelOperations({
+        hotelId: req.hotelId,
+        title: 'Payroll processed',
+        message: `Payroll was processed for ${processed.length} employee(s).`,
+        module: 'payroll',
+        eventType: 'payroll_processed',
+        relatedRecordId: req.hotelId,
+        link: '/staff',
+        eventId: `payroll-processed:${targetMonth}:${req.hotelId}`
+      });
+    }
 
     res.json({
       success: true,
@@ -602,9 +801,59 @@ export const processSalary = async (req, res, next) => {
 };
 
 export const checkIn = async (req, res, next) => {
+  let locationAudit;
   try {
-    if (req.user.role === ROLES.GUEST) {
-      return res.status(403).json({ success: false, message: 'Guests cannot record employee attendance.' });
+    if (
+      req.user.role === ROLES.GUEST
+      || !req.user.hotelId
+      || String(req.user.hotelId) !== String(req.hotelId)
+    ) {
+      return res.status(403).json({ success: false, message: 'Only employees can mark attendance for their assigned hotel.' });
+    }
+
+    const { latitude, longitude, accuracyMeters } = req.body;
+    const locationValidation = await validateAttendanceLocation({
+      hotelId: req.hotelId,
+      latitude,
+      longitude,
+      accuracyMeters
+    });
+    locationAudit = await AttendanceLocationAudit.create({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      action: 'check_in',
+      latitude: Number.isFinite(latitude) ? latitude : null,
+      longitude: Number.isFinite(longitude) ? longitude : null,
+      accuracyMeters: Number.isFinite(accuracyMeters) ? accuracyMeters : null,
+      distanceMeters: locationValidation.distanceMeters,
+      radiusMeters: locationValidation.radiusMeters,
+      maxAccuracyMeters: locationValidation.maxAccuracyMeters,
+      validationResult: locationValidation.valid ? 'valid' : 'invalid',
+      attendanceResult: locationValidation.valid ? 'pending' : 'rejected',
+      failureReason: locationValidation.failureReason
+    });
+
+    const reject = async (status, message) => {
+      if (locationAudit.attendanceResult !== 'rejected' || locationAudit.failureReason !== message) {
+        locationAudit.attendanceResult = 'rejected';
+        locationAudit.failureReason = message;
+        await locationAudit.save();
+      }
+      return res.status(status).json({
+        success: false,
+        message,
+        data: {
+          distanceMeters: locationValidation.distanceMeters,
+          radiusMeters: locationValidation.radiusMeters,
+          accuracyMeters: locationAudit.accuracyMeters,
+          maxAccuracyMeters: locationValidation.maxAccuracyMeters
+        }
+      });
+    };
+
+    if (!locationValidation.valid) {
+      const status = locationValidation.failureReason.includes('outside the permitted') ? 403 : 400;
+      return reject(status, locationValidation.failureReason);
     }
 
     const timestamp = new Date();
@@ -613,7 +862,7 @@ export const checkIn = async (req, res, next) => {
     const late = dayjs(`${dayjs().format('YYYY-MM-DD')} ${time}`).isAfter(dayjs(`${dayjs().format('YYYY-MM-DD')} 09:15`));
     const existing = await Attendance.findOne({ hotelId: req.hotelId, userId: req.user._id, date: attendanceDate });
     if (existing?.checkInTime) {
-      return res.status(409).json({ success: false, message: 'Already checked in today.', data: existing });
+      return reject(409, 'Already checked in today.');
     }
 
     const record = await Attendance.create({
@@ -624,9 +873,16 @@ export const checkIn = async (req, res, next) => {
       checkInTime: time,
       status: late ? 'late' : 'present'
     });
+    locationAudit.attendanceResult = 'recorded';
+    await locationAudit.save();
     res.json({ success: true, message: `Checked in at ${record.checkInTime}.`, data: record });
   } catch (err) {
     if (err.code === 11000) {
+      if (locationAudit) {
+        locationAudit.attendanceResult = 'rejected';
+        locationAudit.failureReason = 'Already checked in today.';
+        await locationAudit.save();
+      }
       return res.status(409).json({ success: false, message: 'Already checked in today.' });
     }
     next(err);
@@ -634,9 +890,59 @@ export const checkIn = async (req, res, next) => {
 };
 
 export const checkOut = async (req, res, next) => {
+  let locationAudit;
   try {
-    if (req.user.role === ROLES.GUEST) {
-      return res.status(403).json({ success: false, message: 'Guests cannot record employee attendance.' });
+    if (
+      req.user.role === ROLES.GUEST
+      || !req.user.hotelId
+      || String(req.user.hotelId) !== String(req.hotelId)
+    ) {
+      return res.status(403).json({ success: false, message: 'Only employees can mark attendance for their assigned hotel.' });
+    }
+
+    const { latitude, longitude, accuracyMeters } = req.body;
+    const locationValidation = await validateAttendanceLocation({
+      hotelId: req.hotelId,
+      latitude,
+      longitude,
+      accuracyMeters
+    });
+    locationAudit = await AttendanceLocationAudit.create({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      action: 'check_out',
+      latitude: Number.isFinite(latitude) ? latitude : null,
+      longitude: Number.isFinite(longitude) ? longitude : null,
+      accuracyMeters: Number.isFinite(accuracyMeters) ? accuracyMeters : null,
+      distanceMeters: locationValidation.distanceMeters,
+      radiusMeters: locationValidation.radiusMeters,
+      maxAccuracyMeters: locationValidation.maxAccuracyMeters,
+      validationResult: locationValidation.valid ? 'valid' : 'invalid',
+      attendanceResult: locationValidation.valid ? 'pending' : 'rejected',
+      failureReason: locationValidation.failureReason
+    });
+
+    const reject = async (status, message) => {
+      if (locationAudit.attendanceResult !== 'rejected' || locationAudit.failureReason !== message) {
+        locationAudit.attendanceResult = 'rejected';
+        locationAudit.failureReason = message;
+        await locationAudit.save();
+      }
+      return res.status(status).json({
+        success: false,
+        message,
+        data: {
+          distanceMeters: locationValidation.distanceMeters,
+          radiusMeters: locationValidation.radiusMeters,
+          accuracyMeters: locationAudit.accuracyMeters,
+          maxAccuracyMeters: locationValidation.maxAccuracyMeters
+        }
+      });
+    };
+
+    if (!locationValidation.valid) {
+      const status = locationValidation.failureReason.includes('outside the permitted') ? 403 : 400;
+      return reject(status, locationValidation.failureReason);
     }
 
     const timestamp = new Date();
@@ -644,23 +950,41 @@ export const checkOut = async (req, res, next) => {
     const time = dayjs(timestamp).format('HH:mm');
     const record = await Attendance.findOne({ hotelId: req.hotelId, userId: req.user._id, date: attendanceDate });
     if (!record?.checkInTime) {
-      return res.status(400).json({ success: false, message: 'Check in before checking out.' });
+      return reject(400, 'Check in before checking out.');
     }
     if (record.checkOutTime) {
-      return res.status(409).json({ success: false, message: 'Already checked out today.', data: record });
+      return reject(409, 'Already checked out today.');
     }
 
-    record.checkOutAt = timestamp;
-    record.checkOutTime = time;
-    record.workingHours = record.checkInAt
+    const workingHours = record.checkInAt
       ? Math.max(0, Math.round(((timestamp - record.checkInAt) / 3600000) * 100) / 100)
       : calcHours(record.checkInTime, time);
-    if (record.workingHours > 0 && record.workingHours < 5 && record.status === 'present') {
-      record.status = 'half_day';
+    const updates = {
+      checkOutAt: timestamp,
+      checkOutTime: time,
+      workingHours
+    };
+    if (workingHours > 0 && workingHours < 5 && record.status === 'present') {
+      updates.status = 'half_day';
     }
-    await record.save();
-    res.json({ success: true, message: `Checked out at ${time}. ${record.workingHours} hours recorded.`, data: record });
+    const updatedRecord = await Attendance.findOneAndUpdate(
+      { _id: record._id, checkOutAt: null },
+      { $set: updates },
+      { new: true, runValidators: true }
+    );
+    if (!updatedRecord) {
+      return reject(409, 'Already checked out today.');
+    }
+    locationAudit.attendanceResult = 'recorded';
+    await locationAudit.save();
+    res.json({ success: true, message: `Checked out at ${time}. ${updatedRecord.workingHours} hours recorded.`, data: updatedRecord });
   } catch (err) {
+    if (locationAudit && err.name === 'VersionError') {
+      locationAudit.attendanceResult = 'rejected';
+      locationAudit.failureReason = 'Attendance changed while this request was being processed. Retry the request.';
+      await locationAudit.save();
+      return res.status(409).json({ success: false, message: locationAudit.failureReason });
+    }
     next(err);
   }
 };
@@ -671,16 +995,56 @@ export const getMyAttendance = async (req, res, next) => {
     const targetMonth = month || dayjs().format('YYYY-MM');
     const start = dayjs(targetMonth).startOf('month').toDate();
     const end = dayjs(targetMonth).endOf('month').toDate();
-    const records = await Attendance.find({
+    const storedRecords = await Attendance.find({
       hotelId: req.hotelId,
       userId: req.user._id,
       date: { $gte: start, $lte: end }
     }).sort({ date: -1 });
-    const today = await Attendance.findOne({
+    const storedToday = await Attendance.findOne({
       hotelId: req.hotelId,
       userId: req.user._id,
       date: dayjs().startOf('day').toDate()
     });
+    const leaveDays = new Map();
+    const leaveRequests = await LeaveRequest.find({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      status: 'approved',
+      startDate: { $lte: end },
+      endDate: { $gte: start }
+    }).select('startDate endDate leaveType').lean();
+    for (const leave of leaveRequests) {
+      let current = dayjs(leave.startDate).isBefore(start, 'day') ? dayjs(start) : dayjs(leave.startDate);
+      const leaveEnd = dayjs(leave.endDate).isAfter(end, 'day') ? dayjs(end) : dayjs(leave.endDate);
+      while (!current.isAfter(leaveEnd, 'day')) {
+        leaveDays.set(current.format('YYYY-MM-DD'), leave.leaveType);
+        current = current.add(1, 'day');
+      }
+    }
+    const recordsByDate = new Map(storedRecords.map((record) => [dayjs(record.date).format('YYYY-MM-DD'), record]));
+    for (const [date, leaveType] of leaveDays) {
+      const existing = recordsByDate.get(date);
+      if (existing) {
+        if (!['absent', 'on_leave'].includes(existing.status)) continue;
+        const data = existing.toObject();
+        data.status = 'on_leave';
+        data.notes = `Approved leave: ${leaveType}`;
+        recordsByDate.set(date, data);
+      } else {
+        recordsByDate.set(date, {
+          _id: `leave-${date}`,
+          userId: req.user._id,
+          date: dayjs(date).toDate(),
+          checkInTime: '',
+          checkOutTime: '',
+          workingHours: 0,
+          status: 'on_leave',
+          notes: `Approved leave: ${leaveType}`
+        });
+      }
+    }
+    const records = [...recordsByDate.values()].sort((a, b) => dayjs(b.date).valueOf() - dayjs(a.date).valueOf());
+    const today = records.find((record) => dayjs(record.date).isSame(dayjs(), 'day')) || storedToday;
     res.json({
       success: true,
       data: {
@@ -695,74 +1059,6 @@ export const getMyAttendance = async (req, res, next) => {
         }
       }
     });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const getLeaves = async (req, res, next) => {
-  try {
-    const filter = { hotelId: req.hotelId };
-    if (req.user.role !== ROLES.HOTEL_ADMIN && req.user.role !== ROLES.SUPER_ADMIN) {
-      filter.userId = req.user._id;
-    }
-    const leaves = await LeaveRequest.find(filter).populate('userId', 'name email role').sort({ createdAt: -1 });
-    res.json({ success: true, data: leaves });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const createLeave = async (req, res, next) => {
-  try {
-    const { startDate, endDate, leaveType = 'casual', reason = '' } = req.body;
-    const start = dayjs(startDate).startOf('day');
-    const end = dayjs(endDate).startOf('day');
-    const days = Math.max(0.5, end.diff(start, 'day') + 1);
-    const leave = await LeaveRequest.create({
-      hotelId: req.hotelId,
-      userId: req.user._id,
-      leaveType,
-      startDate: start.toDate(),
-      endDate: end.toDate(),
-      days,
-      reason
-    });
-    res.status(201).json({ success: true, data: leave });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const reviewLeave = async (req, res, next) => {
-  try {
-    const { status, reviewNotes = '' } = req.body;
-    const leave = await LeaveRequest.findOne({ _id: req.params.id, hotelId: req.hotelId });
-    if (!leave) return res.status(404).json({ success: false, message: 'Leave request not found.' });
-    leave.status = status;
-    leave.reviewNotes = reviewNotes;
-    leave.reviewedBy = req.user._id;
-    await leave.save();
-    if (status === 'approved') {
-      let cursor = dayjs(leave.startDate);
-      const end = dayjs(leave.endDate);
-      while (cursor.isBefore(end) || cursor.isSame(end, 'day')) {
-        await Attendance.findOneAndUpdate(
-          { hotelId: req.hotelId, userId: leave.userId, date: cursor.startOf('day').toDate() },
-          {
-            hotelId: req.hotelId,
-            userId: leave.userId,
-            date: cursor.startOf('day').toDate(),
-            checkInTime: '',
-            status: 'on_leave',
-            notes: leave.leaveType
-          },
-          { upsert: true, new: true }
-        );
-        cursor = cursor.add(1, 'day');
-      }
-    }
-    res.json({ success: true, data: leave });
   } catch (err) {
     next(err);
   }

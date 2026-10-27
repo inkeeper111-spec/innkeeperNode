@@ -3,6 +3,7 @@ import { Hotel, User, Property, Reservation, SubscriptionPlan, Subscription, Inv
 import { HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 import { logAudit } from '../services/auditService.js';
 import { sendEmail } from '../services/emailService.js';
+import { notifyPlatformAdmins, notifyUsers } from '../services/notificationService.js';
 
 export const getPlatformStats = async (req, res, next) => {
   try {
@@ -156,6 +157,31 @@ export const updateHotelStatus = async (req, res, next) => {
       details: { previousStatus, newStatus: status, rejectionReason },
       req
     });
+
+    if (previousStatus !== status) {
+      await notifyPlatformAdmins({
+        title: 'Hotel status changed',
+        message: `${hotel.name} is now ${status.replace(/_/g, ' ')}.`,
+        module: 'platform',
+        eventType: 'hotel_status_changed',
+        relatedRecordId: hotel._id,
+        priority: status === HOTEL_STATUS.SUSPENDED ? 'high' : 'medium',
+        link: '/superadmin',
+        eventId: `hotel-status:${hotel._id}:${status}:${hotel.updatedAt.getTime()}`
+      });
+      await notifyUsers({
+        hotelId: hotel._id,
+        userIds: [hotel.ownerId?._id],
+        title: 'Hotel account status updated',
+        message: `Your hotel account is now ${status.replace(/_/g, ' ')}.`,
+        module: 'platform',
+        eventType: 'hotel_status_changed',
+        relatedRecordId: hotel._id,
+        priority: status === HOTEL_STATUS.SUSPENDED ? 'high' : 'medium',
+        link: '/dashboard',
+        eventId: `hotel-status-owner:${hotel._id}:${status}:${hotel.updatedAt.getTime()}`
+      });
+    }
 
     // Notify hotel owner by email
     if (hotel.ownerId?.email) {

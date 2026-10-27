@@ -1,6 +1,31 @@
 import mongoose from 'mongoose';
 import { HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 
+const attendanceLocationSchema = new mongoose.Schema({
+  latitude: {
+    type: Number,
+    required: true,
+    min: -90,
+    max: 90
+  },
+  longitude: {
+    type: Number,
+    required: true,
+    min: -180,
+    max: 180
+  },
+  radiusMeters: {
+    type: Number,
+    default: 50,
+    min: 1
+  },
+  maxAccuracyMeters: {
+    type: Number,
+    default: 25,
+    min: 1
+  }
+}, { _id: false });
+
 const hotelSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -78,9 +103,27 @@ const hotelSchema = new mongoose.Schema({
     type: String,
     default: 'Free cancellation up to 24 hours prior to check-in.'
   },
+  attendanceLocation: {
+    type: attendanceLocationSchema,
+    default: null
+  },
   invoicePrefix: {
     type: String,
     default: 'INV'
+  },
+  leaveTypes: {
+    type: [{
+      key: { type: String, required: true, trim: true, lowercase: true },
+      label: { type: String, required: true, trim: true },
+      active: { type: Boolean, default: true }
+    }],
+    default: [
+      { key: 'casual', label: 'Casual Leave', active: true },
+      { key: 'sick', label: 'Sick Leave', active: true },
+      { key: 'earned', label: 'Earned Leave', active: true },
+      { key: 'unpaid', label: 'Unpaid Leave', active: true },
+      { key: 'emergency', label: 'Emergency Leave', active: true }
+    ]
   },
   currentPlanId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -105,4 +148,3 @@ const hotelSchema = new mongoose.Schema({
 });
 
 export const Hotel = mongoose.models.Hotel || mongoose.model('Hotel', hotelSchema);
-

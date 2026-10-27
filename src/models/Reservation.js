@@ -74,9 +74,22 @@ const reservationSchema = new mongoose.Schema({
   status: {
     type: String,
     enum: Object.values(RESERVATION_STATUS),
-    default: RESERVATION_STATUS.CONFIRMED,
+    default: RESERVATION_STATUS.PENDING_APPROVAL,
     index: true
   },
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  approvedByRole: String,
+  approvedAt: Date,
+  rejectedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  rejectedByRole: String,
+  rejectedAt: Date,
+  rejectionReason: String,
   paymentStatus: {
     type: String,
     enum: Object.values(PAYMENT_STATUS),
@@ -132,4 +145,3 @@ const reservationSchema = new mongoose.Schema({
 reservationSchema.index({ hotelId: 1, 'rooms.roomId': 1, checkInDate: 1, checkOutDate: 1 });
 
 export const Reservation = mongoose.models.Reservation || mongoose.model('Reservation', reservationSchema);
-
