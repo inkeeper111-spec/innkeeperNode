@@ -11,6 +11,7 @@ import {
   updateTable,
   createOrder,
   updateOrderStatus,
+  updateBillAmounts,
   settleOrder,
   transferToRoomFolio
 } from '../controllers/restaurantController.js';
@@ -31,6 +32,7 @@ router.patch('/items/:id', authorize(ROLES.HOTEL_ADMIN), updateMenuItem);
 router.get('/orders', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), getOrders);
 router.post('/orders', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), createOrder);
 router.patch('/orders/:id/status', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), updateOrderStatus);
+router.patch('/orders/:id/bill-amounts', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), updateBillAmounts);
 router.patch('/orders/:id/settle', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), settleOrder);
 router.post('/orders/transfer-to-folio', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), transferToRoomFolio);
 router.get('/tables', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), getTables);

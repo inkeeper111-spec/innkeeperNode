@@ -264,6 +264,15 @@ describe('PATCH /api/v1/housekeeping/tasks/:id/status', () => {
     expect(res.body.data.status).toBe('cleaning_in_progress');
   });
 
+  it('rejects a status transition that skips the next stage', async () => {
+    if (!taskId) return;
+    const invalid = await request(app)
+      .patch(`/api/v1/housekeeping/tasks/${taskId}/status`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ status: 'inspected' });
+    expect(invalid.status).toBe(409);
+  });
+
   it('should transition task cleaning_in_progress → clean', async () => {
     if (!taskId) return;
     const res = await request(app)

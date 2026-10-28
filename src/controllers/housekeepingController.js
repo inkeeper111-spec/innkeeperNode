@@ -138,6 +138,25 @@ export const updateTaskStatus = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'Completed housekeeping tasks cannot be changed.' });
     }
 
+    const nextStatus = {
+      [HOUSEKEEPING_STATUS.DIRTY]: HOUSEKEEPING_STATUS.CLEANING_IN_PROGRESS,
+      [HOUSEKEEPING_STATUS.CLEANING_IN_PROGRESS]: HOUSEKEEPING_STATUS.CLEAN,
+      [HOUSEKEEPING_STATUS.CLEAN]: HOUSEKEEPING_STATUS.INSPECTED
+    };
+    if (nextStatus[task.status] !== status) {
+      return res.status(409).json({
+        success: false,
+        message: 'Invalid status transition. Move the room to the next readiness stage only.'
+      });
+    }
+
+    const previousStatus = task.status;
+    const previousStartedAt = task.startedAt;
+    const previousCompletedAt = task.completedAt;
+    const previousInspectedBy = task.inspectedBy;
+    const previousInspectedAt = task.inspectedAt;
+    const previousNotes = task.notes;
+
     task.status = status;
     if (notes) task.notes = notes;
 
@@ -153,11 +172,25 @@ export const updateTaskStatus = async (req, res, next) => {
     }
     await task.save();
 
-    // Sync room housekeeping status
+    // Sync room housekeeping status. Restore the task if the room cannot be updated,
+    // so persistence never leaves task and room states inconsistent.
     const room = await Room.findById(task.roomId);
     if (room) {
+      const previousRoomStatus = room.housekeepingStatus;
       room.housekeepingStatus = status;
-      await room.save();
+      try {
+        await room.save();
+      } catch (error) {
+        task.status = previousStatus;
+        task.startedAt = previousStartedAt;
+        task.completedAt = previousCompletedAt;
+        task.inspectedBy = previousInspectedBy;
+        task.inspectedAt = previousInspectedAt;
+        task.notes = previousNotes;
+        await task.save();
+        room.housekeepingStatus = previousRoomStatus;
+        throw error;
+      }
     }
 
     if (status === HOUSEKEEPING_STATUS.CLEAN || status === HOUSEKEEPING_STATUS.INSPECTED) {

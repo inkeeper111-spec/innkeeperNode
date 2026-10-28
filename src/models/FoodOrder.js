@@ -30,6 +30,21 @@ const orderItemSchema = new mongoose.Schema({
   }
 }, { _id: false });
 
+const amountModificationSchema = new mongoose.Schema({
+  field: {
+    type: String,
+    enum: ['unitPrice', 'discountAmount'],
+    required: true
+  },
+  itemIndex: Number,
+  originalAmount: { type: Number, required: true },
+  revisedAmount: { type: Number, required: true },
+  reason: { type: String, required: true, trim: true },
+  editorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  editorName: { type: String, required: true },
+  timestamp: { type: Date, required: true, default: Date.now }
+}, { _id: false });
+
 const foodOrderSchema = new mongoose.Schema({
   hotelId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -120,6 +135,10 @@ const foodOrderSchema = new mongoose.Schema({
   notes: {
     type: String,
     default: ''
+  },
+  amountModifications: {
+    type: [amountModificationSchema],
+    default: []
   },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

@@ -183,6 +183,82 @@ describe('Employee attendance punches', () => {
     expect(invalidCoordinates.status).toBe(400);
   });
 
+  it('preserves optional hotel coordinates across partial settings updates', async () => {
+    const settings = {
+      name: 'Grand Regal Updated',
+      phone: '+1-555-0101',
+      address: '100 Updated Avenue',
+      city: 'Miami Beach',
+      state: 'Florida',
+      country: 'United States',
+      postalCode: '33139',
+      taxNumber: 'US-TAX-UPDATE',
+      currency: 'EUR',
+      timezone: 'America/New_York',
+      checkInTime: '14:30',
+      checkOutTime: '10:30',
+      cancellationPolicy: 'Refundable up to 48 hours before arrival',
+      invoicePrefix: 'GRU'
+    };
+
+    for (const [field, value] of Object.entries(settings)) {
+      const response = await request(app)
+        .put('/api/v1/hotels')
+        .set('Authorization', ['Bearer', adminToken].join(' '))
+        .send({ [field]: value });
+      expect(response.status).toBe(200);
+
+      const saved = await Hotel.findById(hotelId).lean();
+      expect(saved[field]).toBe(value);
+      expect(saved.attendanceLocation.latitude).toBe(hotelLatitude);
+      expect(saved.attendanceLocation.longitude).toBe(hotelLongitude);
+    }
+
+    const combined = await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ name: 'Grand Regal Combined', taxNumber: 'US-TAX-COMBINED' });
+    expect(combined.status).toBe(200);
+
+    const refreshed = await request(app)
+      .get('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.data.hotel.attendanceLocation.latitude).toBe(hotelLatitude);
+    expect(refreshed.body.data.hotel.attendanceLocation.longitude).toBe(hotelLongitude);
+  });
+
+  it('allows coordinate-free settings updates and rejects incomplete coordinate pairs', async () => {
+    await Hotel.updateOne(
+      { _id: hotelId },
+      { $set: { attendanceLocation: null } }
+    );
+
+    const unrelatedUpdate = await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ currency: 'INR', invoicePrefix: 'INC' });
+    expect(unrelatedUpdate.status).toBe(200);
+
+    const incompleteLatitude = await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ attendanceLocation: { latitude: 25.765 } });
+    expect(incompleteLatitude.status).toBe(400);
+    expect(incompleteLatitude.body.message).toContain('latitude and longitude');
+
+    const incompleteLongitude = await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ attendanceLocation: { longitude: -80.195 } });
+    expect(incompleteLongitude.status).toBe(400);
+
+    const saved = await Hotel.findById(hotelId).lean();
+    expect(saved.currency).toBe('INR');
+    expect(saved.invoicePrefix).toBe('INC');
+    expect(saved.attendanceLocation).toBeNull();
+  });
+
   it('prevents guests from creating attendance records', async () => {
     const checkIn = await request(app)
       .post('/api/v1/staff/attendance/check-in')

@@ -28,8 +28,9 @@ export const updateHotelProfile = async (req, res, next) => {
 
     const updates = {};
     for (const field of allowedFields) {
-      if (req.body[field] !== undefined) {
-        updates[field] = req.body[field];
+      const value = req.body[field];
+      if (value !== undefined && value !== null) {
+        updates[field] = value;
       }
     }
 

@@ -487,6 +487,110 @@ export const updateOrderStatus = async (req, res, next) => {
   }
 };
 
+export const updateBillAmounts = async (req, res, next) => {
+  try {
+    const propertyId = await resolveRestaurantProperty(req, res);
+    if (!propertyId) return;
+
+    const { itemUnitPrices = {}, discountAmount, reason } = req.body;
+    const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+    if (!cleanReason) {
+      return res.status(400).json({ success: false, message: 'A reason is required for bill modifications.' });
+    }
+
+    const order = await FoodOrder.findOne({
+      _id: req.params.id,
+      hotelId: req.hotelId,
+      propertyId
+    });
+    if (!order) return res.status(404).json({ success: false, message: 'Restaurant bill not found.' });
+    if (order.paymentStatus !== 'unpaid'
+      || [FOOD_ORDER_STATUS.CANCELLED, FOOD_ORDER_STATUS.SERVED].includes(order.status)) {
+      return res.status(409).json({ success: false, message: 'Paid or finalized restaurant bills cannot be edited directly.' });
+    }
+
+    const updates = order.items.map((item) => ({ ...item.toObject() }));
+    const modificationEntries = [];
+    const isItemIndexValid = (index) => Number.isInteger(index) && index >= 0 && index < updates.length;
+
+    if (itemUnitPrices && typeof itemUnitPrices !== 'object') {
+      return res.status(400).json({ success: false, message: 'itemUnitPrices must be an object keyed by item index.' });
+    }
+
+    for (const [key, rawValue] of Object.entries(itemUnitPrices || {})) {
+      const index = Number(key);
+      const revisedAmount = Number(rawValue);
+      if (!isItemIndexValid(index)) {
+        return res.status(400).json({ success: false, message: `Invalid bill item index: ${key}.` });
+      }
+      if (!Number.isFinite(revisedAmount) || revisedAmount < 0) {
+        return res.status(400).json({ success: false, message: 'Unit prices must be zero or greater.' });
+      }
+      const originalAmount = updates[index].unitPrice;
+      if (Math.abs(originalAmount - revisedAmount) > 0.001) {
+        updates[index].unitPrice = revisedAmount;
+        updates[index].amount = Math.round(revisedAmount * updates[index].quantity * 100) / 100;
+        modificationEntries.push({
+          field: 'unitPrice', itemIndex: index, originalAmount, revisedAmount,
+          reason: cleanReason, editorId: req.user._id,
+          editorName: req.user.name || req.user.email, timestamp: new Date()
+        });
+      }
+    }
+
+    let revisedDiscount = order.discountAmount;
+    if (discountAmount !== undefined) {
+      revisedDiscount = Number(discountAmount);
+      if (!Number.isFinite(revisedDiscount) || revisedDiscount < 0) {
+        return res.status(400).json({ success: false, message: 'Discount must be zero or greater.' });
+      }
+    }
+
+    const subtotal = Math.round(updates.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+    if (revisedDiscount > subtotal) {
+      return res.status(400).json({ success: false, message: 'Discount cannot exceed the item subtotal.' });
+    }
+    if (Math.abs(order.discountAmount - revisedDiscount) > 0.001) {
+      modificationEntries.push({
+        field: 'discountAmount', originalAmount: order.discountAmount, revisedAmount: revisedDiscount,
+        reason: cleanReason, editorId: req.user._id,
+        editorName: req.user.name || req.user.email, timestamp: new Date()
+      });
+    }
+
+    if (modificationEntries.length === 0) {
+      return res.status(400).json({ success: false, message: 'No bill amount changes were provided.' });
+    }
+
+    const taxAmount = Math.round(subtotal * 0.05 * 100) / 100;
+    const totalAmount = Math.round((subtotal - revisedDiscount + taxAmount) * 100) / 100;
+
+    order.items = updates;
+    order.subtotal = subtotal;
+    order.taxAmount = taxAmount;
+    order.discountAmount = revisedDiscount;
+    order.totalAmount = totalAmount;
+    order.amountModifications = [...order.amountModifications, ...modificationEntries];
+    await order.save();
+
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'UPDATE_RESTAURANT_BILL_AMOUNTS',
+      entity: 'FoodOrder',
+      entityId: order._id,
+      details: { orderNumber: order.orderNumber, modifications: modificationEntries },
+      req
+    });
+
+    const updated = await FoodOrder.findById(order._id)
+      .populate('tableId', 'tableNumber name')
+      .populate('amountModifications.editorId', 'name email');
+    res.json({ success: true, message: 'Restaurant bill amounts updated.', data: updated });
+  } catch (err) {
+    next(err);
+  }
+};
+
 export const settleOrder = async (req, res, next) => {
   try {
     const propertyId = await resolveRestaurantProperty(req, res);
