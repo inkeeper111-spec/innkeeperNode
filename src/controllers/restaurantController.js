@@ -255,6 +255,72 @@ export const getOrders = async (req, res, next) => {
   }
 };
 
+const appendItemsToOpenTableOrder = async ({ req, propertyId, table, orderItems }) => {
+  const existing = await FoodOrder.findOne({
+    _id: table.activeOrderId,
+    hotelId: req.hotelId,
+    propertyId,
+    tableId: table._id,
+    orderType: 'dine_in',
+    paymentStatus: 'unpaid',
+    status: { $ne: FOOD_ORDER_STATUS.CANCELLED }
+  });
+  if (!existing) {
+    return {
+      error: {
+        status: 409,
+        message: 'This table bill is already closed. Refresh and choose the table again.'
+      }
+    };
+  }
+
+  const items = [
+    ...existing.items.map((item) => item.toObject()),
+    ...orderItems
+  ];
+  const subtotal = Math.round(items.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+  const taxAmount = Math.round(subtotal * 0.05 * 100) / 100;
+  const totalAmount = Math.round((subtotal - (existing.discountAmount || 0) + taxAmount) * 100) / 100;
+  const nextStatus = existing.status === FOOD_ORDER_STATUS.SERVED
+    ? FOOD_ORDER_STATUS.PENDING
+    : existing.status;
+
+  const updated = await FoodOrder.findOneAndUpdate({
+    _id: existing._id,
+    hotelId: req.hotelId,
+    propertyId,
+    paymentStatus: 'unpaid',
+    status: existing.status,
+    $expr: { $eq: [{ $size: '$items' }, existing.items.length] }
+  }, {
+    $set: { items, subtotal, taxAmount, totalAmount, status: nextStatus }
+  }, { new: true });
+
+  if (!updated) {
+    return {
+      error: {
+        status: 409,
+        message: 'This table order changed. Refresh and add the items again.'
+      }
+    };
+  }
+
+  await notifyRoles({
+    hotelId: req.hotelId,
+    roles: ['restaurant_staff'],
+    title: 'Items added to a table',
+    message: `More items were added to ${updated.tableNumber || `Table ${table.tableNumber}`} (${updated.orderNumber}).`,
+    module: 'restaurant',
+    eventType: 'restaurant_order_items_added',
+    relatedRecordId: updated._id,
+    priority: 'medium',
+    link: '/restaurant',
+    eventId: `restaurant-order-items-added:${updated._id}:${updated.items.length}`
+  });
+
+  return { order: updated };
+};
+
 export const createOrder = async (req, res, next) => {
   let lockedTableId = null;
   let activeOrderId = null;
@@ -331,24 +397,50 @@ export const createOrder = async (req, res, next) => {
 
     let table = null;
     if (orderType === 'dine_in') {
-      table = await RestaurantTable.findOne({
+      const existingTable = await RestaurantTable.findOne({
         _id: tableId,
         hotelId: req.hotelId,
         propertyId,
-        isActive: true,
-        status: 'available',
-        activeOrderId: null
-      }).lean();
-      if (!table) {
+        isActive: true
+      });
+      if (!existingTable) {
         return res.status(409).json({
           success: false,
           message: 'This table is unavailable or already assigned to an active order.'
         });
       }
 
+      if (existingTable.activeOrderId) {
+        const appended = await appendItemsToOpenTableOrder({
+          req,
+          propertyId,
+          table: existingTable,
+          orderItems
+        });
+        if (appended.error) {
+          return res.status(appended.error.status).json({
+            success: false,
+            message: appended.error.message
+          });
+        }
+        return res.status(200).json({
+          success: true,
+          message: 'Items added to the open table order.',
+          data: appended.order
+        });
+      }
+
+      if (existingTable.status !== 'available') {
+        return res.status(409).json({
+          success: false,
+          message: 'This table is unavailable or already assigned to an active order.'
+        });
+      }
+
+      table = existingTable.toObject();
       activeOrderId = new mongoose.Types.ObjectId();
       const lockedTable = await RestaurantTable.findOneAndUpdate({
-        _id: table._id,
+        _id: existingTable._id,
         hotelId: req.hotelId,
         propertyId,
         isActive: true,

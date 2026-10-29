@@ -223,4 +223,44 @@ describe('Restaurant table management and POS assignment', () => {
       .set('Authorization', ['Bearer', adminToken].join(' '));
     expect(afterCancellation.body.data.find((entry) => entry._id === table._id).currentStatus).toBe('available');
   });
+
+  it('adds further rounds to an occupied table on the same bill', async () => {
+    const createdTable = await request(app)
+      .post('/api/v1/restaurant/tables')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ capacity: 4, name: 'Corner' });
+    expect(createdTable.status).toBe(201);
+    const tableId = createdTable.body.data._id;
+
+    const first = await request(app)
+      .post('/api/v1/restaurant/orders')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        orderType: 'dine_in',
+        tableId,
+        items: [{ menuItemId, quantity: 1 }]
+      });
+    expect(first.status).toBe(201);
+
+    const second = await request(app)
+      .post('/api/v1/restaurant/orders')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        orderType: 'dine_in',
+        tableId,
+        items: [{ menuItemId, quantity: 2 }]
+      });
+    expect(second.status).toBe(200);
+    expect(second.body.data._id).toBe(first.body.data._id);
+    expect(second.body.data.items).toHaveLength(2);
+    expect(second.body.data.items[1].quantity).toBe(2);
+    expect(second.body.data.subtotal).toBeGreaterThan(first.body.data.subtotal);
+
+    const occupied = await request(app)
+      .get('/api/v1/restaurant/tables')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    const table = occupied.body.data.find((entry) => entry._id === tableId);
+    expect(table.currentStatus).toBe('occupied');
+    expect(String(table.activeOrderId)).toBe(first.body.data._id);
+  });
 });
