@@ -10,6 +10,7 @@ import {
   receivePurchaseOrder
 } from '../controllers/inventoryController.js';
 import { authenticate, requireTenant } from '../middlewares/auth.js';
+import { validatePhoneFields } from '../middlewares/phoneValidator.js';
 
 const router = Router();
 
@@ -21,11 +22,10 @@ router.post('/items', createInventoryItem);
 router.post('/movements', recordStockMovement);
 
 router.get('/vendors', getVendors);
-router.post('/vendors', createVendor);
+router.post('/vendors', validatePhoneFields({ path: 'phone', required: true }), createVendor);
 
 router.get('/purchase-orders', getPurchaseOrders);
 router.post('/purchase-orders', createPurchaseOrder);
 router.patch('/purchase-orders/:id/receive', receivePurchaseOrder);
 
 export default router;
-

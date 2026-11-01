@@ -12,7 +12,13 @@ export const getDashboardSummary = async (req, res, next) => {
 
     // 1. Room Counts
     const totalRooms = await Room.countDocuments({ hotelId, isActive: true });
-    const availableRooms = await Room.countDocuments({ hotelId, isActive: true, roomStatus: ROOM_STATUS.AVAILABLE });
+    const availableRooms = await Room.countDocuments({
+      hotelId,
+      isActive: true,
+      roomStatus: ROOM_STATUS.AVAILABLE,
+      housekeepingStatus: HOUSEKEEPING_STATUS.CLEAN,
+      maintenanceStatus: { $ne: 'out_of_order' }
+    });
     const occupiedRooms = await Room.countDocuments({ hotelId, roomStatus: ROOM_STATUS.OCCUPIED });
     const reservedRooms = await Room.countDocuments({ hotelId, roomStatus: ROOM_STATUS.RESERVED });
     const dirtyRooms = await Room.countDocuments({

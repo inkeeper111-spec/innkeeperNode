@@ -186,7 +186,7 @@ describe('Employee attendance punches', () => {
   it('preserves optional hotel coordinates across partial settings updates', async () => {
     const settings = {
       name: 'Grand Regal Updated',
-      phone: '+1-555-0101',
+      phone: '+1 - 5555550101',
       address: '100 Updated Avenue',
       city: 'Miami Beach',
       state: 'Florida',

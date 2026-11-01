@@ -49,7 +49,7 @@ app.get('/api/v1/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    service: 'Innkeeper Hotel Management System API'
+    service: 'Nestnn Hotel & Inventory Management Platform API'
   });
 });
 

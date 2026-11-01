@@ -23,6 +23,7 @@ import {
 } from '../controllers/staffController.js';
 import { authenticate, requireTenant, authorize } from '../middlewares/auth.js';
 import { ROLES } from '../config/constants.js';
+import { validatePhoneFields } from '../middlewares/phoneValidator.js';
 
 const router = Router();
 
@@ -31,7 +32,7 @@ router.use(requireTenant);
 
 // ── Staff directory ───────────────────────────────────────────────────────────
 router.get('/',      getStaff);
-router.post('/',     authorize(ROLES.HOTEL_ADMIN), createStaff);
+router.post('/',     authorize(ROLES.HOTEL_ADMIN), validatePhoneFields({ path: 'phone' }), createStaff);
 
 // ── Shifts — static sub-routes BEFORE parameterised ones ─────────────────────
 router.get('/shifts',       getShifts);
@@ -58,6 +59,6 @@ router.post('/salary/process', authorize(ROLES.HOTEL_ADMIN), processSalary);
 
 // ── Staff by ID — parameterised routes LAST ───────────────────────────────────
 router.get('/:id',   getStaffById);
-router.patch('/:id', authorize(ROLES.HOTEL_ADMIN), updateStaff);
+router.patch('/:id', authorize(ROLES.HOTEL_ADMIN), validatePhoneFields({ path: 'phone' }), updateStaff);
 
 export default router;

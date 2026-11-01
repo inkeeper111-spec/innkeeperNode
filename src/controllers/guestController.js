@@ -39,8 +39,23 @@ export const getGuests = async (req, res, next) => {
 
 export const createGuest = async (req, res, next) => {
   try {
+    const idDocumentType = typeof req.body.idDocumentType === 'string'
+      ? req.body.idDocumentType.trim()
+      : '';
+    const idDocumentNumber = typeof req.body.idDocumentNumber === 'string'
+      ? req.body.idDocumentNumber.trim()
+      : '';
+    if (!idDocumentType || idDocumentType === 'none' || !idDocumentNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'A document type and document number are required.'
+      });
+    }
+
     const guest = await Guest.create({
       ...req.body,
+      idDocumentType,
+      idDocumentNumber,
       hotelId: req.hotelId
     });
     await notifyRoles({

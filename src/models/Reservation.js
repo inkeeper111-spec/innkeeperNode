@@ -136,6 +136,26 @@ const reservationSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  keyReturnConfirmed: {
+    type: Boolean,
+    default: false
+  },
+  keyReturnedAt: Date,
+  checkoutAuditHistory: [{
+    processedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true
+    },
+    processedAt: {
+      type: Date,
+      required: true
+    },
+    keyReturned: {
+      type: Boolean,
+      required: true
+    }
+  }],
   cancellationReason: String,
   cancelledAt: Date
 }, {

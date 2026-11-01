@@ -2,6 +2,7 @@ import { MenuCategory, MenuItem, FoodOrder, Reservation, Invoice, Room, Restaura
 import { FOOD_ORDER_STATUS, RESERVATION_STATUS } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
+import { formatCurrency } from '../utils/currency.js';
 import mongoose from 'mongoose';
 import { notifyRoles } from '../services/notificationService.js';
 
@@ -809,7 +810,7 @@ export const transferToRoomFolio = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: `Charge of $${order.totalAmount} transferred to Room Folio (${reservation.bookingReference}).`,
+      message: `Charge of ${formatCurrency(order.totalAmount, req.hotel?.currency || 'USD')} transferred to Room Folio (${reservation.bookingReference}).`,
       data: {
         order,
         invoice

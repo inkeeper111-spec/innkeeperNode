@@ -1,9 +1,38 @@
-import { Invoice, Payment, Reservation, Refund } from '../models/index.js';
-import { INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_METHODS } from '../config/constants.js';
-import { createRazorpayOrder, verifyRazorpayPayment, verifyWebhookSignature, processRazorpayRefund } from '../services/razorpayService.js';
+import { Invoice, Payment, Reservation, Refund, Room } from '../models/index.js';
+import { INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_METHODS, RESERVATION_STATUS, ROOM_STATUS } from '../config/constants.js';
+import { createRazorpayOrder, verifyRazorpayPayment, verifyWebhookSignature } from '../services/razorpayService.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { notifyRoles } from '../services/notificationService.js';
+import { formatCurrency } from '../utils/currency.js';
+
+const applyPaymentToReservation = async (reservationId, amount, processedBy = null) => {
+  if (!reservationId) return null;
+  const reservation = await Reservation.findById(reservationId);
+  if (!reservation) return null;
+
+  reservation.paidAmount = Math.round((reservation.paidAmount + amount) * 100) / 100;
+  reservation.balanceAmount = Math.max(0, Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100);
+  reservation.paymentStatus = reservation.balanceAmount === 0
+    ? PAYMENT_STATUS.PAID
+    : PAYMENT_STATUS.PARTIALLY_PAID;
+
+  if (
+    reservation.paymentStatus === PAYMENT_STATUS.PAID
+    && [RESERVATION_STATUS.APPROVED, RESERVATION_STATUS.CONFIRMED].includes(reservation.status)
+  ) {
+    reservation.status = RESERVATION_STATUS.CHECKED_IN;
+    reservation.checkedInAt = new Date();
+    if (processedBy) reservation.checkedInBy = processedBy;
+    await Room.updateMany(
+      { _id: { $in: reservation.rooms.map((room) => room.roomId) }, hotelId: reservation.hotelId },
+      { $set: { roomStatus: ROOM_STATUS.OCCUPIED } }
+    );
+  }
+
+  await reservation.save();
+  return reservation;
+};
 
 export const getInvoices = async (req, res, next) => {
   try {
@@ -92,6 +121,7 @@ export const recordPayment = async (req, res, next) => {
       reservationId: invoice.reservationId,
       invoiceId: invoice._id,
       amount: payAmount,
+      currency: req.hotel?.currency || 'USD',
       method: method || PAYMENT_METHODS.CASH,
       status: 'captured',
       transactionRef: transactionRef || generateReference('TXN'),
@@ -110,13 +140,7 @@ export const recordPayment = async (req, res, next) => {
 
     // Update Reservation balances if linked
     if (invoice.reservationId) {
-      const reservation = await Reservation.findById(invoice.reservationId);
-      if (reservation) {
-        reservation.paidAmount = Math.round((reservation.paidAmount + payAmount) * 100) / 100;
-        reservation.balanceAmount = Math.max(0, Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100);
-        reservation.paymentStatus = reservation.balanceAmount === 0 ? PAYMENT_STATUS.PAID : PAYMENT_STATUS.PARTIALLY_PAID;
-        await reservation.save();
-      }
+      await applyPaymentToReservation(invoice.reservationId, payAmount, req.user._id);
     }
 
     await logAudit({
@@ -155,11 +179,30 @@ export const getPayments = async (req, res, next) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
+    const refundsByPayment = await Refund.aggregate([
+      {
+        $match: {
+          hotelId: req.hotelId,
+          status: 'processed',
+          paymentId: { $in: payments.map((payment) => payment._id) }
+        }
+      },
+      { $group: { _id: '$paymentId', totalRefunded: { $sum: '$amount' } } }
+    ]);
+    const refundedAmounts = new Map(
+      refundsByPayment.map((refund) => [String(refund._id), Math.round(refund.totalRefunded * 100) / 100])
+    );
+    const paymentResults = payments.map((payment) => {
+      const result = payment.toObject();
+      result.refundedAmount = refundedAmounts.get(String(payment._id)) || 0;
+      result.refundableAmount = Math.max(0, Math.round((payment.amount - result.refundedAmount) * 100) / 100);
+      return result;
+    });
 
     res.json({
       success: true,
       data: {
-        payments,
+        payments: paymentResults,
         pagination: { total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) }
       }
     });
@@ -182,7 +225,7 @@ export const createPaymentOrder = async (req, res, next) => {
     const payAmount = Number(amount || invoice.balanceAmount);
     const order = await createRazorpayOrder({
       amount: payAmount,
-      currency: 'USD',
+      currency: req.hotel?.currency || 'USD',
       receipt: invoice.invoiceNumber,
       notes: {
         invoiceId: invoice._id.toString(),
@@ -253,13 +296,7 @@ export const verifyPayment = async (req, res, next) => {
 
     // Update Reservation
     if (invoice.reservationId) {
-      const reservation = await Reservation.findById(invoice.reservationId);
-      if (reservation) {
-        reservation.paidAmount = Math.round((reservation.paidAmount + payAmount) * 100) / 100;
-        reservation.balanceAmount = Math.max(0, Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100);
-        reservation.paymentStatus = reservation.balanceAmount === 0 ? PAYMENT_STATUS.PAID : PAYMENT_STATUS.PARTIALLY_PAID;
-        await reservation.save();
-      }
+      await applyPaymentToReservation(invoice.reservationId, payAmount, req.user._id);
     }
 
     res.json({
@@ -279,57 +316,131 @@ export const verifyPayment = async (req, res, next) => {
  * Process Refund
  */
 export const refundPayment = async (req, res, next) => {
+  let session;
   try {
     const { paymentId, amount, reason } = req.body;
-    const payment = await Payment.findOne({ _id: paymentId, hotelId: req.hotelId });
-    if (!payment) {
-      return res.status(404).json({ success: false, message: 'Payment record not found.' });
+    const refundAmount = Number(amount);
+    const refundReason = typeof reason === 'string' ? reason.trim() : '';
+    if (
+      !Number.isFinite(refundAmount)
+      || refundAmount <= 0
+      || Math.abs(refundAmount * 100 - Math.round(refundAmount * 100)) > 0.00001
+    ) {
+      return res.status(400).json({ success: false, message: 'Please provide a valid refund amount.' });
+    }
+    if (!refundReason) {
+      return res.status(400).json({ success: false, message: 'A refund reason is required.' });
     }
 
-    const refundAmount = Number(amount || payment.amount);
-    let razorpayRefund = null;
+    session = await Payment.db.startSession();
+    let result;
+    await session.withTransaction(async () => {
+      const payment = await Payment.findOne({ _id: paymentId, hotelId: req.hotelId }).session(session);
+      if (!payment) {
+        const notFound = new Error('Payment record not found.');
+        notFound.statusCode = 404;
+        throw notFound;
+      }
+      if (!['captured', 'refunded'].includes(payment.status)) {
+        const conflict = new Error('This payment has no refundable balance.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
 
-    if (payment.method === PAYMENT_METHODS.RAZORPAY && payment.razorpayPaymentId) {
-      razorpayRefund = await processRazorpayRefund({
-        paymentId: payment.razorpayPaymentId,
+      const priorRefunds = await Refund.aggregate([
+        { $match: { hotelId: payment.hotelId, paymentId: payment._id, status: 'processed' } },
+        { $group: { _id: null, totalRefunded: { $sum: '$amount' } } }
+      ]).session(session);
+      const previouslyRefunded = Math.round((priorRefunds[0]?.totalRefunded || 0) * 100) / 100;
+      const refundableAmount = Math.max(0, Math.round((payment.amount - previouslyRefunded) * 100) / 100);
+      if (refundableAmount <= 0) {
+        const conflict = new Error('This payment has no refundable balance.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      if (refundAmount - refundableAmount > 0.001) {
+        const conflict = new Error(`Refund amount exceeds the refundable balance of ${formatCurrency(refundableAmount, req.hotel?.currency || 'USD')}.`);
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      const [refund] = await Refund.create([{
+        hotelId: req.hotelId,
+        paymentId: payment._id,
+        invoiceId: payment.invoiceId,
+        reservationId: payment.reservationId,
         amount: refundAmount,
-        notes: { reason }
-      });
-    }
+        reason: refundReason,
+        status: 'processed',
+        processedBy: req.user._id
+      }], { session });
 
-    const refund = await Refund.create({
-      hotelId: req.hotelId,
-      paymentId: payment._id,
-      invoiceId: payment.invoiceId,
-      reservationId: payment.reservationId,
-      amount: refundAmount,
-      reason,
-      razorpayRefundId: razorpayRefund?.id,
-      status: 'processed',
-      processedBy: req.user._id
+      const cumulativeRefund = Math.round((previouslyRefunded + refundAmount) * 100) / 100;
+      payment.status = cumulativeRefund >= payment.amount - 0.001 ? 'refunded' : 'captured';
+      await payment.save({ session });
+
+      let invoice = null;
+      if (payment.invoiceId) {
+        invoice = await Invoice.findOne({ _id: payment.invoiceId, hotelId: req.hotelId }).session(session);
+        if (invoice) {
+          invoice.paidAmount = Math.max(0, Math.round((invoice.paidAmount - refundAmount) * 100) / 100);
+          invoice.balanceAmount = Math.max(0, Math.round((invoice.totalAmount - invoice.paidAmount) * 100) / 100);
+          invoice.status = invoice.paidAmount === 0 && cumulativeRefund > 0
+            ? INVOICE_STATUS.REFUNDED
+            : invoice.balanceAmount === 0
+              ? INVOICE_STATUS.PAID
+              : invoice.paidAmount > 0
+                ? INVOICE_STATUS.PARTIALLY_PAID
+                : INVOICE_STATUS.ISSUED;
+          await invoice.save({ session });
+        }
+      }
+
+      let reservation = null;
+      if (payment.reservationId) {
+        reservation = await Reservation.findOne({
+          _id: payment.reservationId,
+          hotelId: req.hotelId
+        }).session(session);
+        if (reservation) {
+          reservation.paidAmount = Math.max(0, Math.round((reservation.paidAmount - refundAmount) * 100) / 100);
+          reservation.balanceAmount = Math.max(0, Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100);
+          reservation.paymentStatus = reservation.paidAmount === 0
+            ? PAYMENT_STATUS.REFUNDED
+            : reservation.balanceAmount === 0
+              ? PAYMENT_STATUS.PAID
+              : PAYMENT_STATUS.PARTIALLY_PAID;
+          await reservation.save({ session });
+        }
+      }
+
+      result = { refund, payment, invoice, reservation };
     });
 
-    payment.status = 'refunded';
-    await payment.save();
-
-    // Adjust Invoice
-    if (payment.invoiceId) {
-      const invoice = await Invoice.findById(payment.invoiceId);
-      if (invoice) {
-        invoice.paidAmount = Math.max(0, invoice.paidAmount - refundAmount);
-        invoice.balanceAmount = Math.round((invoice.totalAmount - invoice.paidAmount) * 100) / 100;
-        invoice.status = INVOICE_STATUS.REFUNDED;
-        await invoice.save();
-      }
-    }
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'PAYMENT_REFUNDED',
+      entity: 'Payment',
+      entityId: result.payment._id,
+      details: {
+        refundId: String(result.refund._id),
+        invoiceId: result.payment.invoiceId ? String(result.payment.invoiceId) : '',
+        amount: refundAmount,
+        reason: refundReason,
+        method: result.payment.method
+      },
+      req
+    });
 
     res.json({
       success: true,
-      message: 'Refund processed successfully.',
-      data: refund
+      message: 'Refund recorded successfully.',
+      data: result
     });
   } catch (err) {
     next(err);
+  } finally {
+    await session?.endSession();
   }
 };
 
@@ -390,6 +501,7 @@ export const razorpayWebhook = async (req, res, next) => {
         reservationId: invoice.reservationId,
         invoiceId: invoice._id,
         amount,
+        currency: paymentEntity.currency || 'USD',
         method: PAYMENT_METHODS.RAZORPAY,
         status: 'captured',
         razorpayOrderId,
@@ -406,15 +518,7 @@ export const razorpayWebhook = async (req, res, next) => {
       await invoice.save();
 
       if (invoice.reservationId) {
-        const reservation = await Reservation.findById(invoice.reservationId);
-        if (reservation) {
-          reservation.paidAmount    = Math.round((reservation.paidAmount + amount) * 100) / 100;
-          reservation.balanceAmount = Math.max(0, Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100);
-          reservation.paymentStatus = reservation.balanceAmount === 0
-            ? PAYMENT_STATUS.PAID
-            : PAYMENT_STATUS.PARTIALLY_PAID;
-          await reservation.save();
-        }
+        await applyPaymentToReservation(invoice.reservationId, amount);
       }
 
       await logAudit({

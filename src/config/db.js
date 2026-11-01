@@ -34,9 +34,10 @@ export const connectDB = async () => {
   }
 
   try {
-    const { MongoMemoryServer } = await import('mongodb-memory-server');
-    memoryServer = await MongoMemoryServer.create({
-      instance: { storageEngine: 'wiredTiger' }
+    const { MongoMemoryReplSet } = await import('mongodb-memory-server');
+    memoryServer = await MongoMemoryReplSet.create({
+      replSet: { count: 1 },
+      instanceOpts: [{ storageEngine: 'wiredTiger' }]
     });
     await mongoose.connect(memoryServer.getUri());
     logger.info(`Connected to in-memory MongoDB: ${memoryServer.getUri()}`);

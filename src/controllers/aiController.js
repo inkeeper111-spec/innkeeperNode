@@ -7,7 +7,7 @@ export const askAIAssistant = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Please provide a question or query for the AI assistant.' });
     }
 
-    const result = await getAIAnalytics(req.hotelId, query.trim());
+    const result = await getAIAnalytics(req.hotelId, query.trim(), req.hotel?.currency || 'USD');
 
     res.json({
       success: true,
@@ -20,7 +20,7 @@ export const askAIAssistant = async (req, res, next) => {
 
 export const getAIInsights = async (req, res, next) => {
   try {
-    const result = await getAIAnalytics(req.hotelId, 'summary');
+    const result = await getAIAnalytics(req.hotelId, 'summary', req.hotel?.currency || 'USD');
     res.json({
       success: true,
       data: {
@@ -32,4 +32,3 @@ export const getAIInsights = async (req, res, next) => {
     next(err);
   }
 };
-

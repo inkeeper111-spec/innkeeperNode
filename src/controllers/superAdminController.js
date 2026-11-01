@@ -194,8 +194,8 @@ export const updateHotelStatus = async (req, res, next) => {
 
       sendEmail({
         to: hotel.ownerId.email,
-        subject: `Innkeeper — Hotel Account Update: ${hotel.name}`,
-        text: `Hello ${hotel.ownerId.name},\n\n${statusMessages[status] || `Your account status is now: ${status}.`}\n\nBest regards,\nInnkeeper Platform Administration`
+        subject: `Nestnn — Hotel Account Update: ${hotel.name}`,
+        text: `Hello ${hotel.ownerId.name},\n\n${statusMessages[status] || `Your account status is now: ${status}.`}\n\nBest regards,\nNestnn Platform Administration`
       });
     }
 

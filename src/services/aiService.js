@@ -1,8 +1,9 @@
 import dayjs from 'dayjs';
 import { Reservation, Room, Invoice, Expense, InventoryItem } from '../models/index.js';
 import { RESERVATION_STATUS, PAYMENT_STATUS, ROOM_STATUS } from '../config/constants.js';
+import { formatCurrency } from '../utils/currency.js';
 
-export const getAIAnalytics = async (hotelId, queryText = '') => {
+export const getAIAnalytics = async (hotelId, queryText = '', currency = 'USD') => {
   const startOfMonth = dayjs().startOf('month').toDate();
   const endOfMonth = dayjs().endOf('month').toDate();
   const startOfPrevMonth = dayjs().subtract(1, 'month').startOf('month').toDate();
@@ -111,17 +112,17 @@ export const getAIAnalytics = async (hotelId, queryText = '') => {
     const growth = prevMonthRevenue > 0
       ? (((thisMonthRevenue - prevMonthRevenue) / prevMonthRevenue) * 100).toFixed(1)
       : 'N/A';
-    aiAnswer = `This month's total invoiced revenue is $${thisMonthRevenue.toLocaleString()}, with $${thisMonthPaid.toLocaleString()} collected in payments and $${thisMonthOutstanding.toLocaleString()} outstanding. Compared to last month ($${prevMonthRevenue.toLocaleString()}), revenue performance shows a ${growth}% variance.`;
+    aiAnswer = `This month's total invoiced revenue is ${formatCurrency(thisMonthRevenue, currency)}, with ${formatCurrency(thisMonthPaid, currency)} collected in payments and ${formatCurrency(thisMonthOutstanding, currency)} outstanding. Compared to last month (${formatCurrency(prevMonthRevenue, currency)}), revenue performance shows a ${growth}% variance.`;
   } else if (q.includes('occupancy') || q.includes('rate') || q.includes('adr') || q.includes('revpar')) {
     queryCategory = 'occupancy';
-    aiAnswer = `Current live occupancy is ${currentOccupancy}% (${occupiedRooms} of ${totalRooms} rooms occupied). For the current month, your Average Daily Rate (ADR) stands at $${adr} across ${roomsSold} room bookings, yielding an estimated RevPAR of $${revpar}.`;
+    aiAnswer = `Current live occupancy is ${currentOccupancy}% (${occupiedRooms} of ${totalRooms} rooms occupied). For the current month, your Average Daily Rate (ADR) stands at ${formatCurrency(adr, currency)} across ${roomsSold} room bookings, yielding an estimated RevPAR of ${formatCurrency(revpar, currency)}.`;
   } else if (q.includes('unpaid') || q.includes('pending payment') || q.includes('balance')) {
     queryCategory = 'unpaid_bookings';
     if (unpaidBookings.length === 0) {
-      aiAnswer = 'All active bookings currently have their balances cleared. Outstanding balance is $0.';
+      aiAnswer = `All active bookings currently have their balances cleared. Outstanding balance is ${formatCurrency(0, currency)}.`;
     } else {
-      const list = unpaidBookings.slice(0, 5).map(b => `${b.bookingReference} (${b.guestName || 'Guest'}): $${b.balanceAmount} due`).join('; ');
-      aiAnswer = `There are ${unpaidBookings.length} booking(s) with pending balances. Key items: ${list}. Total uncollected balance this month: $${thisMonthOutstanding.toLocaleString()}.`;
+      const list = unpaidBookings.slice(0, 5).map(b => `${b.bookingReference} (${b.guestName || 'Guest'}): ${formatCurrency(b.balanceAmount, currency)} due`).join('; ');
+      aiAnswer = `There are ${unpaidBookings.length} booking(s) with pending balances. Key items: ${list}. Total uncollected balance this month: ${formatCurrency(thisMonthOutstanding, currency)}.`;
     }
   } else if (q.includes('stock') || q.includes('inventory') || q.includes('low')) {
     queryCategory = 'inventory';
@@ -133,10 +134,10 @@ export const getAIAnalytics = async (hotelId, queryText = '') => {
     }
   } else if (q.includes('expense')) {
     queryCategory = 'expenses';
-    aiAnswer = `Approved expenses this month total $${totalExpensesThisMonth.toLocaleString()}. Top categories: ${expensesThisMonth.map(e => `${e._id}: $${e.total.toLocaleString()}`).join(', ') || 'No expenses recorded yet'}.`;
+    aiAnswer = `Approved expenses this month total ${formatCurrency(totalExpensesThisMonth, currency)}. Top categories: ${expensesThisMonth.map(e => `${e._id}: ${formatCurrency(e.total, currency)}`).join(', ') || 'No expenses recorded yet'}.`;
   } else {
     queryCategory = 'summary';
-    aiAnswer = `Executive Briefing: Invoiced revenue this month is $${thisMonthRevenue.toLocaleString()} with ${currentOccupancy}% current occupancy. You have ${unpaidBookings.length} unpaid bookings and ${lowStockItems.length} inventory items requiring restocking.`;
+    aiAnswer = `Executive Briefing: Invoiced revenue this month is ${formatCurrency(thisMonthRevenue, currency)} with ${currentOccupancy}% current occupancy. You have ${unpaidBookings.length} unpaid bookings and ${lowStockItems.length} inventory items requiring restocking.`;
   }
 
   // Actionable business insights
@@ -159,7 +160,7 @@ export const getAIAnalytics = async (hotelId, queryText = '') => {
       title: 'Cashflow Health',
       type: thisMonthOutstanding > 0 ? 'warning' : 'positive',
       text: thisMonthOutstanding > 0
-        ? `Pending payment collections total $${thisMonthOutstanding.toLocaleString()}. Ensure front-desk collects remaining balances at check-in or checkout.`
+        ? `Pending payment collections total ${formatCurrency(thisMonthOutstanding, currency)}. Ensure front-desk collects remaining balances at check-in or checkout.`
         : 'Zero outstanding receivables recorded for this billing cycle.'
     }
   ];

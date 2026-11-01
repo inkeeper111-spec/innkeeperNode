@@ -1,5 +1,5 @@
 import { HousekeepingTask, Room, MaintenanceTicket, User } from '../models/index.js';
-import { HOUSEKEEPING_STATUS, PRIORITY, MAINTENANCE_STATUS } from '../config/constants.js';
+import { HOUSEKEEPING_STATUS, PRIORITY, MAINTENANCE_STATUS, ROOM_STATUS } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { notifyRoles, notifyUsers } from '../services/notificationService.js';
@@ -128,7 +128,13 @@ export const updateTaskStatus = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Task not found.' });
     }
     const isManager = ['hotel_admin', 'receptionist'].includes(req.user.role);
-    if (!isManager && String(task.assignedTo) !== String(req.user._id)) {
+    if (status === HOUSEKEEPING_STATUS.INSPECTED && !isManager) {
+      return res.status(403).json({ success: false, message: 'Only a supervisor can inspect and release a room.' });
+    }
+    const isUnassignedHousekeepingTask = req.user.role === 'housekeeping_staff'
+      && !task.assignedTo
+      && task.taskType === 'checkout_cleaning';
+    if (!isManager && String(task.assignedTo) !== String(req.user._id) && !isUnassignedHousekeepingTask) {
       return res.status(403).json({ success: false, message: 'Only the assigned employee or hotel operations can update this task.' });
     }
     if (task.assignedTo && task.assignmentStatus === 'pending' && status !== HOUSEKEEPING_STATUS.DIRTY) {
@@ -160,6 +166,19 @@ export const updateTaskStatus = async (req, res, next) => {
     task.status = status;
     if (notes) task.notes = notes;
 
+    if (isUnassignedHousekeepingTask && status === HOUSEKEEPING_STATUS.CLEANING_IN_PROGRESS) {
+      task.assignedTo = req.user._id;
+      task.assignmentStatus = 'accepted';
+      task.acceptedBy = req.user._id;
+      task.acceptedAt = new Date();
+      task.assignmentHistory.push({
+        action: 'accepted',
+        actorId: req.user._id,
+        assignedTo: req.user._id,
+        timestamp: task.acceptedAt
+      });
+    }
+
     if (status === HOUSEKEEPING_STATUS.CLEANING_IN_PROGRESS && !task.startedAt) {
       task.startedAt = new Date();
     }
@@ -177,7 +196,21 @@ export const updateTaskStatus = async (req, res, next) => {
     const room = await Room.findById(task.roomId);
     if (room) {
       const previousRoomStatus = room.housekeepingStatus;
-      room.housekeepingStatus = status;
+      const previousRoomOperationalStatus = room.roomStatus;
+      room.housekeepingStatus = status === HOUSEKEEPING_STATUS.CLEAN
+        ? HOUSEKEEPING_STATUS.CLEANING_IN_PROGRESS
+        : status === HOUSEKEEPING_STATUS.INSPECTED
+          ? HOUSEKEEPING_STATUS.CLEAN
+        : status;
+      if (
+        status === HOUSEKEEPING_STATUS.INSPECTED
+        && room.roomStatus !== ROOM_STATUS.OUT_OF_SERVICE
+        && room.roomStatus !== ROOM_STATUS.OCCUPIED
+        && room.roomStatus !== ROOM_STATUS.RESERVED
+        && room.maintenanceStatus !== 'out_of_order'
+      ) {
+        room.roomStatus = ROOM_STATUS.AVAILABLE;
+      }
       try {
         await room.save();
       } catch (error) {
@@ -189,6 +222,7 @@ export const updateTaskStatus = async (req, res, next) => {
         task.notes = previousNotes;
         await task.save();
         room.housekeepingStatus = previousRoomStatus;
+        room.roomStatus = previousRoomOperationalStatus;
         throw error;
       }
     }

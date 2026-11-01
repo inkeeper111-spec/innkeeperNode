@@ -32,7 +32,7 @@ export const sendEmail = async ({ to, subject, html, text }) => {
   try {
     const client = getTransporter();
     const info = await client.sendMail({
-      from: process.env.EMAIL_FROM || '"Innkeeper" <noreply@innkeeper.com>',
+      from: process.env.EMAIL_FROM || '"Nestnn" <noreply@innkeeper.com>',
       to,
       subject,
       text,
@@ -45,4 +45,3 @@ export const sendEmail = async ({ to, subject, html, text }) => {
     return null;
   }
 };
-

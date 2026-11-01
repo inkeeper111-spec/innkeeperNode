@@ -1,10 +1,11 @@
 import dayjs from 'dayjs';
-import { Reservation, Room, RoomType, Guest, Invoice } from '../models/index.js';
+import { Reservation, Room, RoomType, Guest, Invoice, HousekeepingTask } from '../models/index.js';
 import { RESERVATION_STATUS, ROOM_STATUS, HOUSEKEEPING_STATUS, PAYMENT_STATUS, INVOICE_STATUS, PRIORITY, ROLES } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { sendEmail } from '../services/emailService.js';
 import { notifyGuestByEmail, notifyRoles } from '../services/notificationService.js';
+import { logger } from '../config/logger.js';
 
 const ACTIVE_RESERVATION_STATUSES = [
   RESERVATION_STATUS.PENDING,
@@ -24,7 +25,7 @@ export const getReservationRequests = async (req, res, next) => {
       status: RESERVATION_STATUS.PENDING_APPROVAL
     })
       .populate('guestId', 'name email phone')
-      .populate('rooms.roomId', 'roomNumber roomStatus isActive')
+      .populate('rooms.roomId', 'roomNumber roomStatus housekeepingStatus maintenanceStatus isActive')
       .populate('rooms.roomTypeId', 'name')
       .sort({ createdAt: 1 });
     const activeReservations = await Reservation.find({
@@ -43,7 +44,10 @@ export const getReservationRequests = async (req, res, next) => {
         && other.rooms.some((room) => roomIds.has(String(room.roomId)))
       );
       const roomsAvailable = reservation.rooms.length > 0 && reservation.rooms.every(
-        (room) => room.roomId?.isActive && room.roomId?.roomStatus !== ROOM_STATUS.OUT_OF_SERVICE
+        (room) => room.roomId?.isActive
+          && room.roomId?.roomStatus !== ROOM_STATUS.OUT_OF_SERVICE
+          && room.roomId?.maintenanceStatus !== 'out_of_order'
+          && room.roomId?.housekeepingStatus === HOUSEKEEPING_STATUS.CLEAN
       );
 
       return {
@@ -109,7 +113,9 @@ export const approveReservationRequest = async (req, res, next) => {
       _id: { $in: reservation.rooms.map((room) => room.roomId) },
       hotelId: req.hotelId,
       isActive: true,
-      roomStatus: { $ne: ROOM_STATUS.OUT_OF_SERVICE }
+      roomStatus: { $ne: ROOM_STATUS.OUT_OF_SERVICE },
+      maintenanceStatus: { $ne: 'out_of_order' },
+      housekeepingStatus: HOUSEKEEPING_STATUS.CLEAN
     });
     if (roomsAvailable !== reservation.rooms.length) {
       return res.status(409).json({
@@ -294,6 +300,9 @@ export const getReservations = async (req, res, next) => {
           message: 'You do not have permission to view reservation requests.'
         });
       }
+      if (!Object.values(RESERVATION_STATUS).includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid reservation status filter.' });
+      }
       filter.status = status;
     } else if (!canManageReservationRequests(req.user)) {
       filter.status = { $ne: RESERVATION_STATUS.PENDING_APPROVAL };
@@ -307,23 +316,27 @@ export const getReservations = async (req, res, next) => {
     }
 
     if (search) {
+      const escapedSearch = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       filter.$or = [
-        { bookingReference: { $regex: search, $options: 'i' } },
-        { guestName: { $regex: search, $options: 'i' } },
-        { guestPhone: { $regex: search, $options: 'i' } },
-        { guestEmail: { $regex: search, $options: 'i' } }
+        { bookingReference: { $regex: escapedSearch, $options: 'i' } },
+        { guestName: { $regex: escapedSearch, $options: 'i' } },
+        { guestPhone: { $regex: escapedSearch, $options: 'i' } },
+        { guestEmail: { $regex: escapedSearch, $options: 'i' } }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
+    const skip = (pageNumber - 1) * pageSize;
     const total = await Reservation.countDocuments(filter);
     const reservations = await Reservation.find(filter)
       .populate('guestId')
       .populate('rooms.roomId')
       .populate('rooms.roomTypeId')
+      .populate('checkedOutBy', 'name email')
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(pageSize);
 
     res.json({
       success: true,
@@ -331,8 +344,9 @@ export const getReservations = async (req, res, next) => {
         reservations,
         pagination: {
           total,
-          page: parseInt(page),
-          pages: Math.ceil(total / parseInt(limit))
+          page: pageNumber,
+          pages: Math.ceil(total / pageSize),
+          limit: pageSize
         }
       }
     });
@@ -432,6 +446,9 @@ export const createReservation = async (req, res, next) => {
 
       if (room.roomStatus === ROOM_STATUS.OUT_OF_SERVICE) {
         return res.status(400).json({ success: false, message: `Room ${room.roomNumber} is currently out of service.` });
+      }
+      if (!room.isActive || room.maintenanceStatus === 'out_of_order' || room.housekeepingStatus !== HOUSEKEEPING_STATUS.CLEAN) {
+        return res.status(409).json({ success: false, message: `Room ${room.roomNumber} is not ready for a new reservation.` });
       }
 
       const ratePerNight = roomType.basePrice;
@@ -623,6 +640,9 @@ export const checkInReservation = async (req, res, next) => {
       if (room.roomStatus === ROOM_STATUS.OUT_OF_SERVICE) {
         return res.status(400).json({ success: false, message: `Room ${room.roomNumber} is currently out of service.` });
       }
+      if (!room.isActive || room.maintenanceStatus === 'out_of_order' || room.housekeepingStatus !== HOUSEKEEPING_STATUS.CLEAN) {
+        return res.status(409).json({ success: false, message: `Room ${room.roomNumber} is not ready for check-in.` });
+      }
       // Update room to occupied
       room.roomStatus = ROOM_STATUS.OCCUPIED;
       await room.save();
@@ -656,60 +676,167 @@ export const checkInReservation = async (req, res, next) => {
  * Check-Out Workflow
  */
 export const checkOutReservation = async (req, res, next) => {
+  let session;
   try {
+    if (req.body.keyReturned !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Confirm that the guest returned the room key before completing checkout.'
+      });
+    }
+
     const reservation = await Reservation.findOne({ _id: req.params.id, hotelId: req.hotelId });
     if (!reservation) {
       return res.status(404).json({ success: false, message: 'Reservation not found.' });
     }
 
-    if (reservation.status === RESERVATION_STATUS.CHECKED_OUT) {
-      return res.status(400).json({ success: false, message: 'Reservation is already checked out.' });
+    if (![RESERVATION_STATUS.CHECKED_IN, RESERVATION_STATUS.CONFIRMED].includes(reservation.status)) {
+      return res.status(409).json({
+        success: false,
+        message: 'Only confirmed or checked-in reservations can be checked out.'
+      });
+    }
+    if (reservation.paymentStatus === PAYMENT_STATUS.UNPAID) {
+      return res.status(409).json({
+        success: false,
+        message: 'Checkout is unavailable while the reservation is unpaid.'
+      });
+    }
+    if (!reservation.rooms?.length) {
+      return res.status(409).json({
+        success: false,
+        message: 'This reservation has no assigned rooms and cannot be checked out.'
+      });
     }
 
-    // Mark all associated rooms as DIRTY and AVAILABLE
-    for (const r of reservation.rooms) {
-      const room = await Room.findById(r.roomId);
-      if (room) {
-        room.roomStatus = ROOM_STATUS.AVAILABLE;
-        room.housekeepingStatus = HOUSEKEEPING_STATUS.DIRTY;
-        await room.save();
+    const checkedOutAt = new Date();
+    session = await Reservation.db.startSession();
+    let checkedOutReservation;
+    await session.withTransaction(async () => {
+      checkedOutReservation = await Reservation.findOneAndUpdate(
+        {
+          _id: reservation._id,
+          hotelId: req.hotelId,
+          status: { $in: [RESERVATION_STATUS.CHECKED_IN, RESERVATION_STATUS.CONFIRMED] }
+        },
+        {
+          $set: {
+            status: RESERVATION_STATUS.CHECKED_OUT,
+            checkedOutAt,
+            checkedOutBy: req.user._id,
+            keyReturnConfirmed: true,
+            keyReturnedAt: checkedOutAt
+          },
+          $push: {
+            checkoutAuditHistory: {
+              processedBy: req.user._id,
+              processedAt: checkedOutAt,
+              keyReturned: true
+            }
+          }
+        },
+        { new: true, runValidators: true, session }
+      );
+      if (!checkedOutReservation) {
+        const conflict = new Error('This reservation has already been checked out.');
+        conflict.statusCode = 409;
+        throw conflict;
       }
-    }
 
-    reservation.status = RESERVATION_STATUS.CHECKED_OUT;
-    reservation.checkedOutAt = new Date();
-    reservation.checkedOutBy = req.user._id;
-    await reservation.save();
+      const roomIds = reservation.rooms.map((room) => room.roomId);
+      const rooms = await Room.find({
+        _id: { $in: roomIds },
+        hotelId: req.hotelId
+      }).session(session);
+      if (rooms.length !== roomIds.length) {
+        const conflict = new Error('One or more rooms for this reservation could not be found.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
 
-    await notifyRoles({
-      hotelId: req.hotelId,
-      roles: [ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST],
-      title: 'Housekeeping Alert',
-      message: `Guest checked out from booking ${reservation.bookingReference}. Rooms queued for cleaning.`,
-      module: 'housekeeping',
-      eventType: 'reservation_checked_out',
-      relatedRecordId: reservation._id,
-      priority: 'medium',
-      link: '/housekeeping',
-      eventId: `reservation-checked-out:${reservation._id}`
+      await Room.updateMany(
+        { _id: { $in: roomIds }, hotelId: req.hotelId },
+        { $set: { housekeepingStatus: HOUSEKEEPING_STATUS.DIRTY } },
+        { session }
+      );
+      await Room.updateMany(
+        {
+          _id: { $in: roomIds },
+          hotelId: req.hotelId,
+          roomStatus: { $ne: ROOM_STATUS.OUT_OF_SERVICE }
+        },
+        { $set: { roomStatus: ROOM_STATUS.AVAILABLE } },
+        { session }
+      );
+
+      await HousekeepingTask.create(
+        rooms.map((room) => ({
+          hotelId: req.hotelId,
+          propertyId: room.propertyId,
+          roomId: room._id,
+          priority: PRIORITY.MEDIUM,
+          status: HOUSEKEEPING_STATUS.DIRTY,
+          taskType: 'checkout_cleaning',
+          notes: `Checkout cleaning for reservation ${reservation.bookingReference}.`,
+          reservationId: reservation._id
+        })),
+        { session }
+      );
     });
+
+    const populatedReservation = await Reservation.findById(checkedOutReservation._id)
+      .populate('checkedOutBy', 'name email')
+      .populate('rooms.roomId', 'roomNumber roomStatus housekeepingStatus');
+
+    let notificationWarning = false;
+    try {
+      await notifyRoles({
+        hotelId: req.hotelId,
+        roles: [ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST],
+        title: 'Housekeeping Alert',
+        message: `Guest checked out from booking ${reservation.bookingReference}. Rooms queued for cleaning.`,
+        module: 'housekeeping',
+        eventType: 'reservation_checked_out',
+        relatedRecordId: reservation._id,
+        priority: 'medium',
+        link: '/housekeeping',
+        eventId: `reservation-checked-out:${reservation._id}`
+      });
+    } catch (notificationError) {
+      notificationWarning = true;
+      logger.error('Checkout completed, but housekeeping notifications could not be delivered.', {
+        reservationId: String(reservation._id),
+        error: notificationError.message
+      });
+    }
 
     await logAudit({
       hotelId: req.hotelId,
       action: 'CHECK_OUT',
       entity: 'Reservation',
       entityId: reservation._id,
-      details: { bookingReference: reservation.bookingReference, balanceAmount: reservation.balanceAmount },
+      details: {
+        bookingReference: reservation.bookingReference,
+        balanceAmount: reservation.balanceAmount,
+        checkedOutAt,
+        checkedOutBy: String(req.user._id),
+        keyReturned: true
+      },
       req
     });
 
     res.json({
       success: true,
-      message: 'Guest checked out successfully. Rooms queued for housekeeping.',
-      data: reservation
+      message: notificationWarning
+        ? 'Guest checked out and rooms are queued for housekeeping, but the operations notification could not be delivered.'
+        : 'Guest checked out successfully. Rooms queued for housekeeping.',
+      warnings: notificationWarning ? ['Housekeeping notifications could not be delivered.'] : [],
+      data: populatedReservation
     });
   } catch (err) {
     next(err);
+  } finally {
+    await session?.endSession();
   }
 };
 
@@ -836,6 +963,13 @@ export const updateReservation = async (req, res, next) => {
 export const cancelReservation = async (req, res, next) => {
   try {
     const { reason } = req.body;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A cancellation reason is required.'
+      });
+    }
+
     const reservation = await Reservation.findOne({ _id: req.params.id, hotelId: req.hotelId });
     if (!reservation) {
       return res.status(404).json({ success: false, message: 'Reservation not found.' });
@@ -853,7 +987,7 @@ export const cancelReservation = async (req, res, next) => {
     }
 
     reservation.status = RESERVATION_STATUS.CANCELLED;
-    reservation.cancellationReason = reason || 'Guest requested cancellation';
+    reservation.cancellationReason = reason.trim();
     reservation.cancelledAt = new Date();
     await reservation.save();
 
@@ -862,7 +996,7 @@ export const cancelReservation = async (req, res, next) => {
       action: 'CANCEL_RESERVATION',
       entity: 'Reservation',
       entityId: reservation._id,
-      details: { bookingReference: reservation.bookingReference, reason },
+      details: { bookingReference: reservation.bookingReference, reason: reservation.cancellationReason },
       req
     });
 

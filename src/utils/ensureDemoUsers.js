@@ -58,7 +58,7 @@ export const ensureDemoUsers = async () => {
   }
 
   const superAdmin = await upsertUser({
-    name: 'Innkeeper Platform Admin',
+    name: 'Nestnn Platform Admin',
     email: 'superadmin@grandstayhms.com',
     password: DEMO_PASSWORD.super,
     role: ROLES.SUPER_ADMIN,

@@ -150,8 +150,8 @@ export const register = async (req, res, next) => {
     // Send Welcome Email
     sendEmail({
       to: user.email,
-      subject: 'Welcome to Innkeeper - Hotel Application Received',
-      text: `Hello ${user.name},\n\nThank you for registering ${hotel.name} with Innkeeper. Your account is created and pending initial platform verification.\n\nBest regards,\nInnkeeper Team`
+      subject: 'Welcome to Nestnn - Hotel Application Received',
+      text: `Hello ${user.name},\n\nThank you for registering ${hotel.name} with Nestnn. Your account is created and pending initial platform verification.\n\nBest regards,\nNestnn Team`
     });
 
     res.status(201).json({
@@ -434,7 +434,7 @@ export const forgotPassword = async (req, res, next) => {
     const resetUrl = `${req.headers.origin || 'http://localhost:3000'}/reset-password?token=${resetToken}`;
     await sendEmail({
       to: user.email,
-      subject: 'Password Reset Request - Innkeeper',
+      subject: 'Password Reset Request - Nestnn',
       text: `You requested a password reset. Please click: ${resetUrl}\n\nIf you did not request this, please ignore this email.`
     });
 

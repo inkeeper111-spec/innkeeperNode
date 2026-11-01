@@ -3,6 +3,7 @@ import request from 'supertest';
 import app from '../app.js';
 import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
+import { HousekeepingTask, Reservation, Room } from '../models/index.js';
 
 let adminToken  = '';
 let receptionistToken = '';
@@ -78,6 +79,46 @@ describe('GET /api/v1/rooms/availability', () => {
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(400);
   });
+
+  it('only offers clean rooms that are in service', async () => {
+    const room = await Room.findOne({
+      hotelId,
+      isActive: true,
+      roomStatus: 'available'
+    });
+    if (!room) return;
+
+    const original = {
+      roomStatus: room.roomStatus,
+      housekeepingStatus: room.housekeepingStatus,
+      maintenanceStatus: room.maintenanceStatus
+    };
+    const queryAvailability = () => request(app)
+      .get('/api/v1/rooms/availability?checkInDate=2035-12-10&checkOutDate=2035-12-12')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+
+    try {
+      room.housekeepingStatus = 'dirty';
+      room.maintenanceStatus = 'normal';
+      await room.save();
+      let response = await queryAvailability();
+      expect(response.body.data.rooms.some((availableRoom) => availableRoom._id === String(room._id))).toBe(false);
+
+      room.housekeepingStatus = 'clean';
+      room.maintenanceStatus = 'out_of_order';
+      await room.save();
+      response = await queryAvailability();
+      expect(response.body.data.rooms.some((availableRoom) => availableRoom._id === String(room._id))).toBe(false);
+
+      room.maintenanceStatus = 'normal';
+      await room.save();
+      response = await queryAvailability();
+      expect(response.body.data.rooms.some((availableRoom) => availableRoom._id === String(room._id))).toBe(true);
+    } finally {
+      Object.assign(room, original);
+      await room.save();
+    }
+  });
 });
 
 // ─── Create Reservation ───────────────────────────────────────────────────────
@@ -94,7 +135,7 @@ describe('POST /api/v1/reservations', () => {
       .send({
         guestData: {
           name:  'Test Guest API',
-          phone: '+1 555 999 0001',
+          phone: '+1 - 5559990001',
           email: 'testguest.api@example.com'
         },
         checkInDate:  ci.toISOString().slice(0, 10),
@@ -153,7 +194,7 @@ describe('Double-booking prevention', () => {
       .post('/api/v1/reservations')
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
-        guestData:    { name: 'Overlap Guest', phone: '+1 555 111 2222', email: 'overlap@test.com' },
+        guestData:    { name: 'Overlap Guest', phone: '+1 - 5551112222', email: 'overlap@test.com' },
         checkInDate:  ci.toISOString().slice(0, 10),
         checkOutDate: co.toISOString().slice(0, 10),
         rooms: [{ roomId, roomTypeId }]
@@ -185,10 +226,67 @@ describe('GET /api/v1/reservations', () => {
       expect(r.status).toBe('confirmed');
     });
   });
+
+  it('combines search, status filtering, and pagination on the server', async () => {
+    if (!reservationId) return;
+    const reservation = await Reservation.findById(reservationId);
+    const search = encodeURIComponent(reservation.bookingReference);
+    const res = await request(app)
+      .get(`/api/v1/reservations?status=confirmed&search=${search}&page=1&limit=1`)
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(res.status).toBe(200);
+    expect(res.body.data.pagination).toMatchObject({ page: 1, limit: 1, total: 1 });
+    expect(res.body.data.reservations).toHaveLength(1);
+    expect(res.body.data.reservations[0].bookingReference).toBe(reservation.bookingReference);
+    expect(res.body.data.reservations[0].status).toBe('confirmed');
+  });
 });
 
 // ─── Check-In / Check-Out ─────────────────────────────────────────────────────
 describe('Reservation lifecycle — check-in & check-out', () => {
+  it('allows staff to manually check out a confirmed reservation after key confirmation', async () => {
+    const room = await Room.findOne({
+      hotelId,
+      isActive: true,
+      housekeepingStatus: 'clean',
+      roomStatus: { $ne: 'out_of_service' },
+      _id: { $ne: roomId }
+    });
+    if (!room) return;
+
+    const checkInDate = new Date();
+    checkInDate.setDate(checkInDate.getDate() + 60);
+    const checkOutDate = new Date(checkInDate);
+    checkOutDate.setDate(checkOutDate.getDate() + 2);
+    const created = await request(app)
+      .post('/api/v1/reservations')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        guestData: {
+          name: 'Confirmed Checkout Guest',
+          phone: '+1 - 5551234567',
+          email: 'confirmed.checkout@example.com'
+        },
+        checkInDate: checkInDate.toISOString().slice(0, 10),
+        checkOutDate: checkOutDate.toISOString().slice(0, 10),
+        rooms: [{ roomId: room._id, roomTypeId: room.roomTypeId }],
+        bookingSource: 'manual'
+      });
+    expect(created.status).toBe(201);
+    expect(created.body.data.reservation.status).toBe('confirmed');
+    await Reservation.findByIdAndUpdate(created.body.data.reservation._id, {
+      paymentStatus: 'paid'
+    });
+
+    const checkout = await request(app)
+      .post(`/api/v1/reservations/${created.body.data.reservation._id}/check-out`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ keyReturned: true });
+    expect(checkout.status).toBe(200);
+    expect(checkout.body.data.status).toBe('checked_out');
+    expect(checkout.body.data.keyReturnConfirmed).toBe(true);
+  });
+
   it('should check in a confirmed reservation', async () => {
     if (!reservationId) return;
     const res = await request(app)
@@ -206,13 +304,65 @@ describe('Reservation lifecycle — check-in & check-out', () => {
     expect(res.status).toBe(400);
   });
 
+  it('requires key return confirmation and an authorized role for checkout', async () => {
+    if (!reservationId) return;
+    const unpaidCheckout = await request(app)
+      .post(`/api/v1/reservations/${reservationId}/check-out`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ keyReturned: true });
+    expect(unpaidCheckout.status).toBe(409);
+    expect(unpaidCheckout.body.message).toMatch(/unpaid/i);
+    await Reservation.findByIdAndUpdate(reservationId, { paymentStatus: 'paid' });
+
+    const missingKeyConfirmation = await request(app)
+      .post(`/api/v1/reservations/${reservationId}/check-out`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({});
+    expect(missingKeyConfirmation.status).toBe(400);
+
+    const unauthorized = await request(app)
+      .post(`/api/v1/reservations/${reservationId}/check-out`)
+      .set('Authorization', ['Bearer', restaurantToken].join(' '))
+      .send({ keyReturned: true });
+    expect(unauthorized.status).toBe(403);
+  });
+
   it('should check out a checked-in reservation', async () => {
     if (!reservationId) return;
     const res = await request(app)
       .post(`/api/v1/reservations/${reservationId}/check-out`)
+      .send({ keyReturned: true })
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('checked_out');
+    expect(res.body.data.keyReturnConfirmed).toBe(true);
+    expect(res.body.data.checkedOutBy).toBeTruthy();
+    expect(res.body.data.checkedOutAt).toBeTruthy();
+    expect(res.body.data.checkoutAuditHistory).toHaveLength(1);
+
+    const reservation = await Reservation.findById(reservationId);
+    const room = await Room.findById(roomId);
+    const task = await HousekeepingTask.findOne({ reservationId: reservation._id, roomId });
+    expect(task?.taskType).toBe('checkout_cleaning');
+    expect(room.housekeepingStatus).toBe('dirty');
+
+    const duplicate = await request(app)
+      .post(`/api/v1/reservations/${reservationId}/check-out`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ keyReturned: true });
+    expect(duplicate.status).toBe(409);
+
+    for (const status of ['cleaning_in_progress', 'clean', 'inspected']) {
+      const update = await request(app)
+        .patch(`/api/v1/housekeeping/tasks/${task._id}/status`)
+        .set('Authorization', ['Bearer', adminToken].join(' '))
+        .send({ status });
+      expect(update.status).toBe(200);
+      if (status === 'clean') {
+        expect((await Room.findById(roomId)).housekeepingStatus).toBe('cleaning_in_progress');
+      }
+    }
+    expect((await Room.findById(roomId)).housekeepingStatus).toBe('clean');
   });
 });
 
@@ -229,7 +379,7 @@ describe('POST /api/v1/reservations/:id/cancel', () => {
       .post('/api/v1/reservations')
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
-        guestData:    { name: 'Cancel Me Guest', phone: '+1 555 777 8888', email: 'cancelme@test.com' },
+        guestData:    { name: 'Cancel Me Guest', phone: '+1 - 5557778888', email: 'cancelme@test.com' },
         checkInDate:  ci.toISOString().slice(0, 10),
         checkOutDate: co.toISOString().slice(0, 10),
         rooms: [{ roomId, roomTypeId }]
@@ -238,13 +388,26 @@ describe('POST /api/v1/reservations/:id/cancel', () => {
     if (createRes.status !== 201) return; // no room available, skip
     const newId = createRes.body.data.reservation._id;
 
+    const missingReason = await request(app)
+      .post(`/api/v1/reservations/${newId}/cancel`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ reason: '   ' });
+    expect(missingReason.status).toBe(400);
+
     const res = await request(app)
       .post(`/api/v1/reservations/${newId}/cancel`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ reason: 'Guest requested cancellation' });
+      .send({ reason: 'Guest changed travel plans' });
 
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('cancelled');
+    expect(res.body.data.cancellationReason).toBe('Guest changed travel plans');
+
+    const availability = await request(app)
+      .get(`/api/v1/rooms/availability?checkInDate=${ci.toISOString().slice(0, 10)}&checkOutDate=${co.toISOString().slice(0, 10)}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(availability.status).toBe(200);
+    expect(availability.body.data.rooms.some((room) => room._id === String(roomId))).toBe(true);
   });
 });
 
@@ -259,7 +422,7 @@ describe('Reservation request approval workflow', () => {
       hotelId,
       guestName: 'Reservation Request Guest',
       guestEmail: email,
-      guestPhone: '+1 555 222 3344',
+      guestPhone: '+1 - 5552223344',
       checkInDate: checkIn.toISOString().slice(0, 10),
       checkOutDate: checkOut.toISOString().slice(0, 10),
       roomTypeId,

@@ -11,7 +11,7 @@ const startServer = async () => {
     await connectDB();
     await ensureDemoUsers();
     app.listen(PORT, () => {
-      logger.info(`Innkeeper Server listening on http://localhost:${PORT}`);
+      logger.info(`Nestnn Server listening on http://localhost:${PORT}`);
       logger.info(`API Base Endpoint: http://localhost:${PORT}/api/v1`);
     });
   } catch (error) {
@@ -21,4 +21,3 @@ const startServer = async () => {
 };
 
 startServer();
-

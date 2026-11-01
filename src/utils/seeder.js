@@ -78,7 +78,7 @@ export const seedDatabase = async () => {
 
   // 2. Super Admin User
   const superAdmin = await User.create({
-    name: 'Innkeeper Platform Admin',
+    name: 'Nestnn Platform Admin',
     email: 'superadmin@grandstayhms.com',
     password: 'AdminPassword123!',
     role: ROLES.SUPER_ADMIN,

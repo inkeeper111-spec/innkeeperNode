@@ -150,7 +150,7 @@ describe('Hotel Management System - API Integration Tests', () => {
           guestData: {
             name: 'Charlotte Bronte',
             email: 'charlotte@example.com',
-            phone: '+1 (555) 234-5678'
+            phone: '+1 - 5552345678'
           },
           checkInDate: nextWeekStart,
           checkOutDate: nextWeekEnd,
@@ -177,7 +177,7 @@ describe('Hotel Management System - API Integration Tests', () => {
           guestData: {
             name: 'Conflict Tester',
             email: 'conflict@example.com',
-            phone: '+1 (555) 999-0000'
+            phone: '+1 - 5559990000'
           },
           checkInDate: nextWeekStart,
           checkOutDate: nextWeekEnd,
@@ -271,4 +271,3 @@ describe('Hotel Management System - API Integration Tests', () => {
     });
   });
 });
-

@@ -3,6 +3,7 @@ import request from 'supertest';
 import app from '../app.js';
 import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
+import { Room } from '../models/index.js';
 
 let adminToken = '';
 let roomTypeId = '';
@@ -110,14 +111,13 @@ describe('POST /api/v1/rooms', () => {
 });
 
 describe('PATCH /api/v1/rooms/:id/status', () => {
-  it('should update room housekeeping status', async () => {
+  it('should require room housekeeping status changes to use the task workflow', async () => {
     if (!roomId) return;
     const res = await request(app)
       .patch(`/api/v1/rooms/${roomId}/status`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ housekeepingStatus: 'dirty' });
-    expect(res.status).toBe(200);
-    expect(res.body.data.housekeepingStatus).toBe('dirty');
+    expect(res.status).toBe(400);
   });
 
   it('should update room operational status', async () => {
@@ -128,5 +128,27 @@ describe('PATCH /api/v1/rooms/:id/status', () => {
       .send({ roomStatus: 'out_of_service' });
     expect(res.status).toBe(200);
     expect(res.body.data.roomStatus).toBe('out_of_service');
+  });
+
+  it('should not allow a dirty room to be marked available, occupied, or reserved', async () => {
+    if (!roomId) return;
+    const room = await Room.findById(roomId);
+    if (!room) return;
+
+    const originalHousekeepingStatus = room.housekeepingStatus;
+    room.housekeepingStatus = 'dirty';
+    await room.save();
+    try {
+      for (const roomStatus of ['available', 'occupied', 'reserved']) {
+        const res = await request(app)
+          .patch(`/api/v1/rooms/${roomId}/status`)
+          .set('Authorization', ['Bearer', adminToken].join(' '))
+          .send({ roomStatus });
+        expect(res.status).toBe(409);
+      }
+    } finally {
+      room.housekeepingStatus = originalHousekeepingStatus;
+      await room.save();
+    }
   });
 });

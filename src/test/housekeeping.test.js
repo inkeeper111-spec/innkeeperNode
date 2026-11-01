@@ -3,7 +3,7 @@ import request from 'supertest';
 import app from '../app.js';
 import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
-import { User } from '../models/index.js';
+import { Room, User } from '../models/index.js';
 
 let adminToken  = '';
 let roomId      = '';
@@ -45,6 +45,43 @@ beforeAll(async () => {
 });
 
 describe('housekeeping assignment rejection', () => {
+  it('lets housekeeping claim checkout cleaning and requires a supervisor inspection', async () => {
+    const created = await request(app)
+      .post('/api/v1/housekeeping/tasks')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ roomId, taskType: 'checkout_cleaning', notes: 'Unassigned checkout clean' });
+    expect(created.status).toBe(201);
+    const taskId = created.body.data._id;
+
+    const started = await request(app)
+      .patch(`/api/v1/housekeeping/tasks/${taskId}/status`)
+      .set('Authorization', ['Bearer', housekeeperToken].join(' '))
+      .send({ status: 'cleaning_in_progress' });
+    expect(started.status).toBe(200);
+    expect(String(started.body.data.assignedTo)).toBe(housekeeperId);
+    expect(started.body.data.assignmentStatus).toBe('accepted');
+
+    const completed = await request(app)
+      .patch(`/api/v1/housekeeping/tasks/${taskId}/status`)
+      .set('Authorization', ['Bearer', housekeeperToken].join(' '))
+      .send({ status: 'clean' });
+    expect(completed.status).toBe(200);
+    expect((await Room.findById(roomId)).housekeepingStatus).toBe('cleaning_in_progress');
+
+    const unauthorizedInspection = await request(app)
+      .patch(`/api/v1/housekeeping/tasks/${taskId}/status`)
+      .set('Authorization', ['Bearer', housekeeperToken].join(' '))
+      .send({ status: 'inspected' });
+    expect(unauthorizedInspection.status).toBe(403);
+
+    const inspected = await request(app)
+      .patch(`/api/v1/housekeeping/tasks/${taskId}/status`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ status: 'inspected' });
+    expect(inspected.status).toBe(200);
+    expect((await Room.findById(roomId)).housekeepingStatus).toBe('clean');
+  });
+
   it('requires a non-whitespace reason and limits tasks to the assigned employee', async () => {
     if (!roomId) return;
     const assigned = await request(app)

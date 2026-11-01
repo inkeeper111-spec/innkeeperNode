@@ -20,6 +20,11 @@ const housekeepingTaskSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  reservationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Reservation',
+    default: null
+  },
   assignedTo: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -85,5 +90,13 @@ const housekeepingTaskSchema = new mongoose.Schema({
   timestamps: true,
   optimisticConcurrency: true
 });
+
+housekeepingTaskSchema.index(
+  { reservationId: 1, roomId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { reservationId: { $type: 'objectId' } }
+  }
+);
 
 export const HousekeepingTask = mongoose.models.HousekeepingTask || mongoose.model('HousekeepingTask', housekeepingTaskSchema);

@@ -222,7 +222,9 @@ export const updateTicket = async (req, res, next) => {
       if (ticket.roomId && ticket.takesRoomOutOfService) {
         const room = await Room.findById(ticket.roomId);
         if (room && room.roomStatus === ROOM_STATUS.OUT_OF_SERVICE) {
-          room.roomStatus = ROOM_STATUS.AVAILABLE;
+          if (room.roomStatus !== ROOM_STATUS.OCCUPIED && room.roomStatus !== ROOM_STATUS.RESERVED) {
+            room.roomStatus = ROOM_STATUS.AVAILABLE;
+          }
           room.maintenanceStatus = 'normal';
           await room.save();
         }

@@ -3,6 +3,24 @@ import { Room, RoomType, Property, Reservation } from '../models/index.js';
 import { ROOM_STATUS, HOUSEKEEPING_STATUS, RESERVATION_STATUS } from '../config/constants.js';
 import { notifyRoles } from '../services/notificationService.js';
 
+const validateRoomStatusChange = (status, room) => {
+  if ([ROOM_STATUS.AVAILABLE, ROOM_STATUS.OCCUPIED, ROOM_STATUS.RESERVED].includes(status)) {
+    if (room.housekeepingStatus !== HOUSEKEEPING_STATUS.CLEAN) {
+      return 'A room must be clean before it can be available, occupied, or reserved.';
+    }
+    if (room.maintenanceStatus === 'out_of_order' || room.roomStatus === ROOM_STATUS.OUT_OF_SERVICE) {
+      return 'An out-of-service room cannot be made available, occupied, or reserved.';
+    }
+  }
+  if (
+    status === ROOM_STATUS.AVAILABLE
+    && [ROOM_STATUS.OCCUPIED, ROOM_STATUS.RESERVED].includes(room.roomStatus)
+  ) {
+    return 'An occupied or reserved room cannot be made available manually.';
+  }
+  return '';
+};
+
 export const getRooms = async (req, res, next) => {
   try {
     const { roomStatus, housekeepingStatus, floor, roomTypeId, search } = req.query;
@@ -101,6 +119,27 @@ export const getRoomById = async (req, res, next) => {
 
 export const updateRoom = async (req, res, next) => {
   try {
+    if (Object.hasOwn(req.body, 'housekeepingStatus')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Room housekeeping status must be changed through the housekeeping task workflow.'
+      });
+    }
+
+    if (req.body.roomStatus) {
+      const currentRoom = await Room.findOne({ _id: req.params.id, hotelId: req.hotelId });
+      if (!currentRoom) {
+        return res.status(404).json({ success: false, message: 'Room not found.' });
+      }
+      const validationMessage = validateRoomStatusChange(req.body.roomStatus, currentRoom);
+      if (validationMessage) {
+        return res.status(409).json({
+          success: false,
+          message: validationMessage
+        });
+      }
+    }
+
     const room = await Room.findOneAndUpdate(
       { _id: req.params.id, hotelId: req.hotelId },
       req.body,
@@ -131,10 +170,28 @@ export const updateRoom = async (req, res, next) => {
 export const updateRoomStatus = async (req, res, next) => {
   try {
     const { roomStatus, housekeepingStatus, maintenanceStatus } = req.body;
+    if (housekeepingStatus) {
+      return res.status(400).json({
+        success: false,
+        message: 'Room housekeeping status must be changed through the housekeeping task workflow.'
+      });
+    }
+    if (roomStatus) {
+      const currentRoom = await Room.findOne({ _id: req.params.id, hotelId: req.hotelId });
+      if (!currentRoom) {
+        return res.status(404).json({ success: false, message: 'Room not found.' });
+      }
+      const validationMessage = validateRoomStatusChange(roomStatus, currentRoom);
+      if (validationMessage) {
+        return res.status(409).json({
+          success: false,
+          message: validationMessage
+        });
+      }
+    }
     const update = {};
 
     if (roomStatus) update.roomStatus = roomStatus;
-    if (housekeepingStatus) update.housekeepingStatus = housekeepingStatus;
     if (maintenanceStatus) update.maintenanceStatus = maintenanceStatus;
 
     const room = await Room.findOneAndUpdate(
@@ -212,6 +269,8 @@ export const checkAvailability = async (req, res, next) => {
       hotelId: req.hotelId,
       isActive: true,
       roomStatus: { $ne: ROOM_STATUS.OUT_OF_SERVICE },
+      housekeepingStatus: HOUSEKEEPING_STATUS.CLEAN,
+      maintenanceStatus: { $ne: 'out_of_order' },
       _id: { $nin: Array.from(bookedRoomIds) }
     };
 
