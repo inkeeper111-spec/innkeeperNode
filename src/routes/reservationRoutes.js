@@ -27,7 +27,7 @@ router.post('/:id/approve', authorize(ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST), ap
 router.post('/:id/reject', authorize(ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST), rejectReservationRequest);
 router.get('/:id', getReservationById);
 router.patch('/:id', updateReservation);
-router.post('/:id/check-in', checkInReservation);
+router.post('/:id/check-in', authorize(ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST), checkInReservation);
 router.post('/:id/check-out', authorize(ROLES.HOTEL_ADMIN, ROLES.RECEPTIONIST), checkOutReservation);
 router.post('/:id/cancel', cancelReservation);
 

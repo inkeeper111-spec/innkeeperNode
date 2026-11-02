@@ -2,6 +2,7 @@ import dayjs from 'dayjs';
 import { Room, RoomType, Property, Reservation } from '../models/index.js';
 import { ROOM_STATUS, HOUSEKEEPING_STATUS, RESERVATION_STATUS } from '../config/constants.js';
 import { notifyRoles } from '../services/notificationService.js';
+import { validateReservationDateRange } from '../utils/reservationDates.js';
 
 const validateRoomStatusChange = (status, room) => {
   if ([ROOM_STATUS.AVAILABLE, ROOM_STATUS.OCCUPIED, ROOM_STATUS.RESERVED].includes(status)) {
@@ -238,15 +239,14 @@ export const checkAvailability = async (req, res, next) => {
       });
     }
 
-    const start = dayjs(checkInDate).startOf('day').toDate();
-    const end = dayjs(checkOutDate).startOf('day').toDate();
-
-    if (dayjs(start).isAfter(end) || dayjs(start).isSame(end)) {
+    const dateRange = validateReservationDateRange(checkInDate, checkOutDate, req.hotel?.timezone);
+    if (dateRange.error) {
       return res.status(400).json({
         success: false,
-        message: 'Check-out date must be after check-in date.'
+        message: dateRange.error
       });
     }
+    const { start, end } = dateRange;
 
     // 1. Find all active reservations overlapping the date range
     // Overlap condition: (existingCheckIn < requestedCheckOut) AND (existingCheckOut > requestedCheckIn)

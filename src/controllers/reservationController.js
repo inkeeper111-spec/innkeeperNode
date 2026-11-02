@@ -1,11 +1,18 @@
 import dayjs from 'dayjs';
-import { Reservation, Room, RoomType, Guest, Invoice, HousekeepingTask } from '../models/index.js';
+import { Hotel, Reservation, Room, RoomType, Guest, Invoice, HousekeepingTask } from '../models/index.js';
 import { RESERVATION_STATUS, ROOM_STATUS, HOUSEKEEPING_STATUS, PAYMENT_STATUS, INVOICE_STATUS, PRIORITY, ROLES } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { sendEmail } from '../services/emailService.js';
 import { notifyGuestByEmail, notifyRoles } from '../services/notificationService.js';
 import { logger } from '../config/logger.js';
+import {
+  combineHotelDateAndTime,
+  dateOnlyFromStoredDate,
+  isValidHotelTime,
+  validateReservationDateRange
+} from '../utils/reservationDates.js';
+import { createReservationWithUniqueReference } from '../utils/reservationReference.js';
 
 const ACTIVE_RESERVATION_STATUSES = [
   RESERVATION_STATUS.PENDING,
@@ -362,6 +369,8 @@ export const createReservation = async (req, res, next) => {
       guestData,
       checkInDate,
       checkOutDate,
+      checkInTime,
+      checkOutTime,
       rooms, // Array of { roomId, roomTypeId }
       adultsCount = 1,
       childrenCount = 0,
@@ -370,14 +379,46 @@ export const createReservation = async (req, res, next) => {
       discountAmount = 0
     } = req.body;
 
-    const start = dayjs(checkInDate).startOf('day').toDate();
-    const end = dayjs(checkOutDate).startOf('day').toDate();
-    const nights = dayjs(end).diff(dayjs(start), 'day');
-
-    if (nights <= 0) {
+    const dateRange = validateReservationDateRange(checkInDate, checkOutDate, req.hotel?.timezone);
+    if (dateRange.error) {
       return res.status(400).json({
         success: false,
-        message: 'Check-out date must be at least one day after check-in date.'
+        message: dateRange.error
+      });
+    }
+    const { start, end, nights } = dateRange;
+    const hotel = req.hotel || await Hotel.findById(req.hotelId).select('name timezone checkInTime checkOutTime allowCustomCheckInTime allowCustomCheckOutTime');
+    if (!hotel) {
+      return res.status(404).json({ success: false, message: 'Hotel organization not found.' });
+    }
+
+    const canOverrideTimes = [ROLES.HOTEL_ADMIN, ROLES.SUPER_ADMIN].includes(req.user.role);
+    if ((checkInTime !== undefined && (!hotel.allowCustomCheckInTime || !canOverrideTimes))
+      || (checkOutTime !== undefined && (!hotel.allowCustomCheckOutTime || !canOverrideTimes))) {
+      return res.status(403).json({
+        success: false,
+        message: 'Custom reservation times are not enabled for your account.'
+      });
+    }
+    const expectedCheckInTime = checkInTime ?? hotel.checkInTime ?? '12:00';
+    const expectedCheckOutTime = checkOutTime ?? hotel.checkOutTime ?? '11:00';
+    if (!isValidHotelTime(expectedCheckInTime) || !isValidHotelTime(expectedCheckOutTime)) {
+      return res.status(400).json({ success: false, message: 'Please provide valid reservation times.' });
+    }
+    const expectedCheckInAt = combineHotelDateAndTime(
+      checkInDate,
+      expectedCheckInTime,
+      hotel.timezone
+    );
+    const expectedCheckOutAt = combineHotelDateAndTime(
+      checkOutDate,
+      expectedCheckOutTime,
+      hotel.timezone
+    );
+    if (!expectedCheckInAt || !expectedCheckOutAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'The selected reservation time is not valid in the hotel timezone.'
       });
     }
 
@@ -475,18 +516,19 @@ export const createReservation = async (req, res, next) => {
     const taxAmount = Math.round((subtotal - discountAmount) * (taxRatePercent / 100) * 100) / 100;
     const totalAmount = Math.round((subtotal - discountAmount + taxAmount) * 100) / 100;
 
-    const bookingReference = generateReference('BK');
-
-    const reservation = await Reservation.create({
+    const reservation = await createReservationWithUniqueReference(Reservation, {
       hotelId: req.hotelId,
       propertyId: req.propertyId || reservationRooms[0]?.roomId?.propertyId,
-      bookingReference,
       guestId: guest._id,
       guestName: guest.name,
       guestEmail: guest.email,
       guestPhone: guest.phone,
       checkInDate: start,
       checkOutDate: end,
+      expectedCheckInTime,
+      expectedCheckOutTime,
+      expectedCheckInAt,
+      expectedCheckOutAt,
       rooms: reservationRooms,
       adultsCount,
       childrenCount,
@@ -500,7 +542,8 @@ export const createReservation = async (req, res, next) => {
       paidAmount: 0,
       balanceAmount: totalAmount,
       specialRequests
-    });
+    }, hotel);
+    const { bookingReference } = reservation;
 
     // Create Initial Invoice
     const invoiceNumber = generateReference('INV');
@@ -611,6 +654,13 @@ export const getReservationById = async (req, res, next) => {
  */
 export const checkInReservation = async (req, res, next) => {
   try {
+    if (req.body.confirmed !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Confirm the guest arrival before completing check-in.'
+      });
+    }
+
     const reservation = await Reservation.findOne({ _id: req.params.id, hotelId: req.hotelId });
     if (!reservation) {
       return res.status(404).json({ success: false, message: 'Reservation not found.' });
@@ -755,17 +805,17 @@ export const checkOutReservation = async (req, res, next) => {
       }
 
       await Room.updateMany(
-        { _id: { $in: roomIds }, hotelId: req.hotelId },
-        { $set: { housekeepingStatus: HOUSEKEEPING_STATUS.DIRTY } },
-        { session }
-      );
-      await Room.updateMany(
         {
           _id: { $in: roomIds },
           hotelId: req.hotelId,
           roomStatus: { $ne: ROOM_STATUS.OUT_OF_SERVICE }
         },
-        { $set: { roomStatus: ROOM_STATUS.AVAILABLE } },
+        {
+          $set: {
+            housekeepingStatus: HOUSEKEEPING_STATUS.DIRTY,
+            roomStatus: ROOM_STATUS.CLEANING
+          }
+        },
         { session }
       );
 
@@ -872,15 +922,42 @@ export const updateReservation = async (req, res, next) => {
       });
     }
 
-    // If dates are being changed, re-validate availability
-    if (checkInDate && checkOutDate) {
-      const newStart = dayjs(checkInDate).startOf('day').toDate();
-      const newEnd   = dayjs(checkOutDate).startOf('day').toDate();
-
-      if (dayjs(newEnd).diff(dayjs(newStart), 'day') <= 0) {
+    // If either date is edited, validate the complete date range before saving.
+    if (checkInDate !== undefined || checkOutDate !== undefined) {
+      const requestedCheckInDate = checkInDate === undefined
+        ? dateOnlyFromStoredDate(reservation.checkInDate)
+        : checkInDate;
+      const requestedCheckOutDate = checkOutDate === undefined
+        ? dateOnlyFromStoredDate(reservation.checkOutDate)
+        : checkOutDate;
+      const dateRange = validateReservationDateRange(
+        requestedCheckInDate,
+        requestedCheckOutDate,
+        req.hotel?.timezone
+      );
+      if (dateRange.error) {
         return res.status(400).json({
           success: false,
-          message: 'Check-out must be at least one day after check-in.'
+          message: dateRange.error
+        });
+      }
+      const { start: newStart, end: newEnd, nights } = dateRange;
+      const expectedInTime = reservation.expectedCheckInTime || req.hotel?.checkInTime || '12:00';
+      const expectedOutTime = reservation.expectedCheckOutTime || req.hotel?.checkOutTime || '11:00';
+      const expectedCheckInAt = combineHotelDateAndTime(
+        requestedCheckInDate,
+        expectedInTime,
+        req.hotel?.timezone
+      );
+      const expectedCheckOutAt = combineHotelDateAndTime(
+        requestedCheckOutDate,
+        expectedOutTime,
+        req.hotel?.timezone
+      );
+      if (!expectedCheckInAt || !expectedCheckOutAt) {
+        return res.status(400).json({
+          success: false,
+          message: 'The selected reservation time is not valid in the hotel timezone.'
         });
       }
 
@@ -903,7 +980,6 @@ export const updateReservation = async (req, res, next) => {
         });
       }
 
-      const nights = dayjs(newEnd).diff(dayjs(newStart), 'day');
       let subtotal = 0;
       for (const r of reservation.rooms) {
         const roomType = await RoomType.findById(r.roomTypeId);
@@ -917,6 +993,10 @@ export const updateReservation = async (req, res, next) => {
 
       reservation.checkInDate   = newStart;
       reservation.checkOutDate  = newEnd;
+      reservation.expectedCheckInTime = expectedInTime;
+      reservation.expectedCheckOutTime = expectedOutTime;
+      reservation.expectedCheckInAt = expectedCheckInAt;
+      reservation.expectedCheckOutAt = expectedCheckOutAt;
       reservation.subtotal      = subtotal;
       reservation.discountAmount = disc;
       reservation.taxAmount     = taxAmount;

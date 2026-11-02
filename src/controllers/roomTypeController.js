@@ -51,16 +51,42 @@ export const getRoomTypeById = async (req, res, next) => {
 
 export const updateRoomType = async (req, res, next) => {
   try {
+    const allowedFields = [
+      'name',
+      'code',
+      'description',
+      'maxOccupancy',
+      'adultCapacity',
+      'childCapacity',
+      'bedConfiguration',
+      'basePrice',
+      'extraGuestPrice',
+      'amenities',
+      'images',
+      'isActive'
+    ];
+    const updates = Object.fromEntries(
+      Object.entries(req.body).filter(([field]) => allowedFields.includes(field))
+    );
+    if (typeof updates.code === 'string') updates.code = updates.code.trim().toUpperCase();
+    if (typeof updates.name === 'string') updates.name = updates.name.trim();
+
     const roomType = await RoomType.findOneAndUpdate(
       { _id: req.params.id, hotelId: req.hotelId },
-      req.body,
-      { new: true }
+      { $set: updates },
+      { new: true, runValidators: true }
     );
     if (!roomType) {
       return res.status(404).json({ success: false, message: 'Room type not found.' });
     }
     res.json({ success: true, message: 'Room type updated.', data: roomType });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'A room category with this code already exists.'
+      });
+    }
     next(err);
   }
 };
@@ -80,4 +106,3 @@ export const deleteRoomType = async (req, res, next) => {
     next(err);
   }
 };
-

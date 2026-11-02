@@ -74,6 +74,9 @@ export const createTask = async (req, res, next) => {
 
     // Sync room housekeeping status
     room.housekeepingStatus = HOUSEKEEPING_STATUS.DIRTY;
+    if (![ROOM_STATUS.OCCUPIED, ROOM_STATUS.RESERVED, ROOM_STATUS.OUT_OF_SERVICE].includes(room.roomStatus)) {
+      room.roomStatus = ROOM_STATUS.CLEANING;
+    }
     await room.save();
 
     if (task.assignedTo) {

@@ -7,6 +7,7 @@ import { Room } from '../models/index.js';
 
 let adminToken = '';
 let roomTypeId = '';
+let createdRoomTypeId = '';
 let roomId     = '';
 
 beforeAll(async () => {
@@ -54,6 +55,7 @@ describe('POST /api/v1/room-types', () => {
     expect(res.status).toBe(201);
     expect(res.body.data.name).toBe('API Test Suite');
     expect(res.body.data.basePrice).toBe(199);
+    createdRoomTypeId = res.body.data._id;
   });
 
   it('should reject duplicate room type code', async () => {
@@ -68,6 +70,39 @@ describe('POST /api/v1/room-types', () => {
       .send({ name: 'Dup Code 2', code: 'ATS', basePrice: 100, maxOccupancy: 2, bedConfiguration: '1 Bed' });
 
     expect(res.status).toBe(409);
+  });
+});
+
+describe('PUT /api/v1/room-types/:id', () => {
+  it('updates room category details and ignores tenant ownership fields', async () => {
+    const res = await request(app)
+      .put(`/api/v1/room-types/${createdRoomTypeId}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        name: 'Updated API Suite',
+        code: 'UAS',
+        description: 'Updated category details',
+        basePrice: 249,
+        maxOccupancy: 3,
+        bedConfiguration: '2 Queen Beds',
+        amenities: ['Wi-Fi', 'Balcony'],
+        hotelId: '000000000000000000000001'
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.name).toBe('Updated API Suite');
+    expect(res.body.data.code).toBe('UAS');
+    expect(res.body.data.basePrice).toBe(249);
+    expect(res.body.data.description).toBe('Updated category details');
+    expect(res.body.data.hotelId).not.toBe('000000000000000000000001');
+  });
+
+  it('rejects invalid category prices', async () => {
+    const res = await request(app)
+      .put(`/api/v1/room-types/${createdRoomTypeId}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ basePrice: -1 });
+    expect(res.status).toBe(400);
   });
 });
 

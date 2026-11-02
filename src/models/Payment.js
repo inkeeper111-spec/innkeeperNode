@@ -18,6 +18,11 @@ const paymentSchema = new mongoose.Schema({
     ref: 'Invoice',
     index: true
   },
+  subscriptionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Subscription',
+    index: true
+  },
   amount: {
     type: Number,
     required: true,
@@ -61,4 +66,3 @@ const paymentSchema = new mongoose.Schema({
 paymentSchema.index({ hotelId: 1, razorpayPaymentId: 1 }, { sparse: true });
 
 export const Payment = mongoose.models.Payment || mongoose.model('Payment', paymentSchema);
-

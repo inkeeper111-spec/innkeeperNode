@@ -1,6 +1,6 @@
 import dayjs from 'dayjs';
-import { Hotel, User, Property, Reservation, SubscriptionPlan, Subscription, Invoice, Payment, AuditLog } from '../models/index.js';
-import { HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
+import { Hotel, User, Property, Reservation, SubscriptionPlan, Subscription, Invoice, Payment, AuditLog, SubscriptionSettings } from '../models/index.js';
+import { HOTEL_STATUS, REGISTRATION_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 import { logAudit } from '../services/auditService.js';
 import { sendEmail } from '../services/emailService.js';
 import { notifyPlatformAdmins, notifyUsers } from '../services/notificationService.js';
@@ -8,8 +8,11 @@ import { notifyPlatformAdmins, notifyUsers } from '../services/notificationServi
 export const getPlatformStats = async (req, res, next) => {
   try {
     const totalHotels      = await Hotel.countDocuments();
-    const activeHotels     = await Hotel.countDocuments({ status: HOTEL_STATUS.ACTIVE });
-    const pendingHotels    = await Hotel.countDocuments({ status: HOTEL_STATUS.PENDING_APPROVAL });
+    const activeHotels     = await Hotel.countDocuments({
+      status: HOTEL_STATUS.ACTIVE,
+      subscriptionStatus: { $in: [SUBSCRIPTION_STATUS.ACTIVE, SUBSCRIPTION_STATUS.TRIALING] }
+    });
+    const pendingHotels    = await Hotel.countDocuments({ registrationStatus: REGISTRATION_STATUS.PENDING });
     const suspendedHotels  = await Hotel.countDocuments({ status: HOTEL_STATUS.SUSPENDED });
     const rejectedHotels   = await Hotel.countDocuments({ status: HOTEL_STATUS.REJECTED });
     const totalUsers       = await User.countDocuments();
@@ -143,9 +146,22 @@ export const updateHotelStatus = async (req, res, next) => {
     }
 
     const previousStatus = hotel.status; // capture BEFORE mutation
+    const previousRegistrationStatus = hotel.registrationStatus;
+    if (status === HOTEL_STATUS.REJECTED && !String(rejectionReason || '').trim()) {
+      return res.status(400).json({ success: false, message: 'A rejection reason is required.' });
+    }
     hotel.status = status;
-    if (status === HOTEL_STATUS.REJECTED && rejectionReason) {
-      hotel.rejectionReason = rejectionReason;
+    if (status === HOTEL_STATUS.ACTIVE) {
+      hotel.registrationStatus = REGISTRATION_STATUS.APPROVED;
+      hotel.approvedBy = req.user._id;
+      hotel.approvedAt = new Date();
+    } else if (status === HOTEL_STATUS.REJECTED) {
+      hotel.registrationStatus = REGISTRATION_STATUS.REJECTED;
+      hotel.rejectedBy = req.user._id;
+      hotel.rejectedAt = new Date();
+      hotel.rejectionReason = String(rejectionReason).trim();
+    } else if (status === HOTEL_STATUS.SUSPENDED) {
+      hotel.registrationStatus = REGISTRATION_STATUS.SUSPENDED;
     }
     await hotel.save();
 
@@ -154,14 +170,20 @@ export const updateHotelStatus = async (req, res, next) => {
       action: `HOTEL_STATUS_UPDATED_${status.toUpperCase()}`,
       entity: 'Hotel',
       entityId: hotel._id,
-      details: { previousStatus, newStatus: status, rejectionReason },
+      details: {
+        previousStatus,
+        newStatus: status,
+        previousRegistrationStatus,
+        registrationStatus: hotel.registrationStatus,
+        rejectionReason
+      },
       req
     });
 
     if (previousStatus !== status) {
       await notifyPlatformAdmins({
         title: 'Hotel status changed',
-        message: `${hotel.name} is now ${status.replace(/_/g, ' ')}.`,
+        message: `${hotel.name} registration is now ${hotel.registrationStatus}.`,
         module: 'platform',
         eventType: 'hotel_status_changed',
         relatedRecordId: hotel._id,
@@ -172,13 +194,19 @@ export const updateHotelStatus = async (req, res, next) => {
       await notifyUsers({
         hotelId: hotel._id,
         userIds: [hotel.ownerId?._id],
-        title: 'Hotel account status updated',
-        message: `Your hotel account is now ${status.replace(/_/g, ' ')}.`,
+        title: status === HOTEL_STATUS.ACTIVE ? 'Hotel registration approved'
+          : status === HOTEL_STATUS.REJECTED ? 'Hotel registration rejected'
+            : 'Hotel account suspended',
+        message: status === HOTEL_STATUS.ACTIVE
+          ? 'Your hotel registration has been approved. Sign in to choose your subscription and activate your modules.'
+          : status === HOTEL_STATUS.REJECTED
+            ? `Your hotel registration was rejected. Reason: ${String(rejectionReason).trim()}`
+            : 'Your hotel account has been suspended. Please contact platform support.',
         module: 'platform',
         eventType: 'hotel_status_changed',
         relatedRecordId: hotel._id,
         priority: status === HOTEL_STATUS.SUSPENDED ? 'high' : 'medium',
-        link: '/dashboard',
+        link: status === HOTEL_STATUS.ACTIVE ? '/subscription' : '/registration-status',
         eventId: `hotel-status-owner:${hotel._id}:${status}:${hotel.updatedAt.getTime()}`
       });
     }
@@ -186,7 +214,7 @@ export const updateHotelStatus = async (req, res, next) => {
     // Notify hotel owner by email
     if (hotel.ownerId?.email) {
       const statusMessages = {
-        [HOTEL_STATUS.ACTIVE]:           'Your hotel account has been approved and is now active. You can log in and begin operations.',
+        [HOTEL_STATUS.ACTIVE]:           'Your hotel registration has been approved. Sign in to select a subscription before using hotel modules.',
         [HOTEL_STATUS.SUSPENDED]:        'Your hotel account has been temporarily suspended. Please contact platform support for assistance.',
         [HOTEL_STATUS.REJECTED]:         `Your hotel account application has been rejected. Reason: ${rejectionReason || 'Please contact support.'}`,
         [HOTEL_STATUS.PENDING_APPROVAL]: 'Your hotel account has been set back to pending review.'
@@ -216,13 +244,18 @@ export const assignPlanToHotel = async (req, res, next) => {
     if (!hotel) {
       return res.status(404).json({ success: false, message: 'Hotel not found.' });
     }
+    if (hotel.registrationStatus !== REGISTRATION_STATUS.APPROVED) {
+      return res.status(409).json({ success: false, message: 'Approve hotel registration before assigning a subscription plan.' });
+    }
 
     const plan = await SubscriptionPlan.findById(planId);
     if (!plan) {
       return res.status(404).json({ success: false, message: 'Subscription plan not found.' });
     }
 
-    const amount = billingCycle === 'annual' ? plan.annualPrice : plan.monthlyPrice;
+    const settings = await SubscriptionSettings.findOne({ key: 'global' }).lean();
+    const minimum = Math.max(999, settings?.minimumMonthlyAmount || 999) * (billingCycle === 'annual' ? 12 : 1);
+    const amount = Math.max(minimum, billingCycle === 'annual' ? plan.annualPrice : plan.monthlyPrice);
     const endDate = billingCycle === 'annual'
       ? dayjs().add(1, 'year').toDate()
       : dayjs().add(1, 'month').toDate();
@@ -339,11 +372,23 @@ export const getSubscriptions = async (req, res, next) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
+    const subscriptionIds = subscriptions.map((subscription) => subscription._id);
+    const payments = await Payment.find({ subscriptionId: { $in: subscriptionIds } })
+      .sort({ createdAt: -1 })
+      .lean();
+    const paymentHistory = new Map();
+    payments.forEach((payment) => {
+      const key = String(payment.subscriptionId);
+      paymentHistory.set(key, [...(paymentHistory.get(key) || []), payment]);
+    });
 
     res.json({
       success: true,
       data: {
-        subscriptions,
+        subscriptions: subscriptions.map((subscription) => ({
+          ...subscription.toObject(),
+          paymentHistory: paymentHistory.get(String(subscription._id)) || []
+        })),
         pagination: { total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) }
       }
     });

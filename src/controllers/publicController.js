@@ -1,7 +1,8 @@
-import dayjs from 'dayjs';
 import { Hotel, Room, RoomType, Reservation, Guest, Invoice, Property } from '../models/index.js';
 import { HOTEL_STATUS, RESERVATION_STATUS, ROOM_STATUS, PAYMENT_STATUS, INVOICE_STATUS } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
+import { combineHotelDateAndTime, validateReservationDateRange } from '../utils/reservationDates.js';
+import { createReservationWithUniqueReference } from '../utils/reservationReference.js';
 
 const serializePublicHotel = (hotel) => ({
   id: hotel._id,
@@ -100,8 +101,26 @@ export const searchPublicRooms = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Hotel, check-in, and check-out dates are required.' });
     }
 
-    const start = dayjs(checkInDate).startOf('day').toDate();
-    const end = dayjs(checkOutDate).startOf('day').toDate();
+    const hotel = await Hotel.findById(hotelId).select('timezone checkInTime checkOutTime');
+    if (!hotel) {
+      return res.status(404).json({ success: false, message: 'Hotel not found.' });
+    }
+    const dateRange = validateReservationDateRange(checkInDate, checkOutDate, hotel.timezone);
+    if (dateRange.error) {
+      return res.status(400).json({ success: false, message: dateRange.error });
+    }
+    const { start, end, nights } = dateRange;
+    const expectedCheckInTime = hotel.checkInTime || '12:00';
+    const expectedCheckOutTime = hotel.checkOutTime || '11:00';
+    if (
+      !combineHotelDateAndTime(checkInDate, expectedCheckInTime, hotel.timezone)
+      || !combineHotelDateAndTime(checkOutDate, expectedCheckOutTime, hotel.timezone)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Hotel reservation times are not valid in the configured timezone.'
+      });
+    }
 
     // Find active overlapping reservations
     const overlapping = await Reservation.find({
@@ -155,7 +174,7 @@ export const searchPublicRooms = async (req, res, next) => {
       data: {
         checkInDate: start,
         checkOutDate: end,
-        nights: dayjs(end).diff(dayjs(start), 'day'),
+        nights,
         categories: Object.values(roomTypeMap)
       }
     });
@@ -179,12 +198,24 @@ export const bookPublicReservation = async (req, res, next) => {
       specialRequests = ''
     } = req.body;
 
-    const start = dayjs(checkInDate).startOf('day').toDate();
-    const end = dayjs(checkOutDate).startOf('day').toDate();
-    const nights = dayjs(end).diff(dayjs(start), 'day');
-
-    if (nights <= 0) {
-      return res.status(400).json({ success: false, message: 'Invalid stay dates.' });
+    const hotel = await Hotel.findById(hotelId).select('name timezone checkInTime checkOutTime');
+    if (!hotel) {
+      return res.status(404).json({ success: false, message: 'Hotel not found.' });
+    }
+    const dateRange = validateReservationDateRange(checkInDate, checkOutDate, hotel.timezone);
+    if (dateRange.error) {
+      return res.status(400).json({ success: false, message: dateRange.error });
+    }
+    const { start, end, nights } = dateRange;
+    const expectedCheckInTime = hotel.checkInTime || '12:00';
+    const expectedCheckOutTime = hotel.checkOutTime || '11:00';
+    const expectedCheckInAt = combineHotelDateAndTime(checkInDate, expectedCheckInTime, hotel.timezone);
+    const expectedCheckOutAt = combineHotelDateAndTime(checkOutDate, expectedCheckOutTime, hotel.timezone);
+    if (!expectedCheckInAt || !expectedCheckOutAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Hotel reservation times are not valid in the configured timezone.'
+      });
     }
 
     const roomType = await RoomType.findOne({ _id: roomTypeId, hotelId });
@@ -229,17 +260,19 @@ export const bookPublicReservation = async (req, res, next) => {
     const taxAmount = Math.round(subtotal * 0.10 * 100) / 100;
     const totalAmount = Math.round((subtotal + taxAmount) * 100) / 100;
 
-    const bookingReference = generateReference('BK');
-    const reservation = await Reservation.create({
+    const reservation = await createReservationWithUniqueReference(Reservation, {
       hotelId,
       propertyId: assignedRoom.propertyId,
-      bookingReference,
       guestId: guest._id,
       guestName,
       guestEmail: guest.email,
       guestPhone,
       checkInDate: start,
       checkOutDate: end,
+      expectedCheckInTime,
+      expectedCheckOutTime,
+      expectedCheckInAt,
+      expectedCheckOutAt,
       rooms: [{
         roomId: assignedRoom._id,
         roomTypeId: roomType._id,
@@ -257,7 +290,8 @@ export const bookPublicReservation = async (req, res, next) => {
       paidAmount: 0,
       balanceAmount: totalAmount,
       specialRequests
-    });
+    }, hotel);
+    const { bookingReference } = reservation;
 
     // Create Invoice
     const invoiceNumber = generateReference('INV');

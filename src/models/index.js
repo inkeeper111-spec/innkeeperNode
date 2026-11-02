@@ -6,6 +6,8 @@ export { Hotel } from './Hotel.js';
 export { Property } from './Property.js';
 export { SubscriptionPlan } from './SubscriptionPlan.js';
 export { Subscription } from './Subscription.js';
+export { SubscriptionModule } from './SubscriptionModule.js';
+export { SubscriptionSettings } from './SubscriptionSettings.js';
 export { RoomType } from './RoomType.js';
 export { Room } from './Room.js';
 export { Guest } from './Guest.js';

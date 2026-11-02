@@ -14,6 +14,13 @@ import {
 } from '../controllers/superAdminController.js';
 import { authenticate, authorize } from '../middlewares/auth.js';
 import { ROLES } from '../config/constants.js';
+import {
+  getSubscriptionConfiguration,
+  updateSubscriptionModule,
+  updateSubscriptionSettings,
+  getModuleSubscribers,
+  updateManagedSubscription
+} from '../controllers/subscriptionAdminController.js';
 
 const router = Router();
 
@@ -38,6 +45,11 @@ router.patch('/plans/:id',   updatePlan);   // alias for PATCH callers
 
 // Subscriptions
 router.get('/subscriptions', getSubscriptions);
+router.patch('/subscriptions/:id/manage', updateManagedSubscription);
+router.get('/modules', getSubscriptionConfiguration);
+router.put('/modules/:key', updateSubscriptionModule);
+router.get('/modules/:key/hotels', getModuleSubscribers);
+router.put('/subscription-settings', updateSubscriptionSettings);
 
 // Audit logs
 router.get('/audit-logs', getAuditLogs);

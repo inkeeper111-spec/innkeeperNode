@@ -102,7 +102,7 @@ export const seedDatabase = async () => {
     taxNumber: 'US-TAX-893201',
     currency: 'USD',
     timezone: 'America/New_York',
-    checkInTime: '15:00',
+    checkInTime: '12:00',
     checkOutTime: '11:00',
     cancellationPolicy: 'Full refund 48 hours prior to check-in. One night charged thereafter.',
     invoicePrefix: 'REGAL',
@@ -538,7 +538,7 @@ export const seedDatabase = async () => {
     priority: PRIORITY.HIGH,
     taskType: 'checkout_cleaning',
     status: HOUSEKEEPING_STATUS.DIRTY,
-    notes: 'Prioritize for 14:00 check-in. Change all linens and restock coffee pods.'
+    notes: 'Prioritize for the configured hotel check-in time. Change all linens and restock coffee pods.'
   });
 
   // 10. Restaurant Menu & Orders

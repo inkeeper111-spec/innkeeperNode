@@ -22,6 +22,7 @@ import reportRoutes from './routes/reportRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import aiRoutes from './routes/aiRoutes.js';
 import publicRoutes from './routes/publicRoutes.js';
+import subscriptionRoutes from './routes/subscriptionRoutes.js';
 
 import { errorHandler } from './middlewares/errorHandler.js';
 import { apiLimiter } from './middlewares/rateLimiter.js';
@@ -62,6 +63,7 @@ app.use('/api/v1/rooms', roomRoutes);
 app.use('/api/v1/reservations', reservationRoutes);
 app.use('/api/v1/guests', guestRoutes);
 app.use('/api/v1/billing', billingRoutes);
+app.use('/api/v1/subscriptions', subscriptionRoutes);
 app.use('/api/v1/housekeeping', housekeepingRoutes);
 app.use('/api/v1/restaurant', restaurantRoutes);
 app.use('/api/v1/inventory', inventoryRoutes);

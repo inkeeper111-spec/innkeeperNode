@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { User, Hotel } from '../models/index.js';
+import { User, Hotel, Subscription } from '../models/index.js';
 import { ROLES, HOTEL_STATUS } from '../config/constants.js';
 
 export const authenticate = async (req, res, next) => {
@@ -75,28 +75,113 @@ export const requireTenant = async (req, res, next) => {
     return res.status(404).json({ success: false, message: 'Hotel organization not found.' });
   }
 
-  if (hotel.status === HOTEL_STATUS.PENDING_APPROVAL) {
-    req.hotelPending = true;
-    req.hotel = hotel;
-    return next();
-  }
+  const path = req.baseUrl.replace(/^\/api\/v1/, '').replace(/^\//, '');
+  req.hotel = hotel;
+  if (['hotels', 'billing', 'notifications'].includes(path)) return next();
 
-  if (hotel.status === HOTEL_STATUS.SUSPENDED) {
+  const registrationStatus = hotel.registrationStatus
+    || (hotel.status === HOTEL_STATUS.PENDING_APPROVAL ? 'pending' : hotel.status);
+  if (registrationStatus === 'pending') {
     return res.status(403).json({
       success: false,
-      message: 'Hotel account has been suspended. Please contact platform support.',
-      hotelStatus: hotel.status
+      message: 'Your hotel registration is awaiting Super Admin approval.',
+      code: 'REGISTRATION_PENDING',
+      registrationStatus
     });
   }
-
-  if (hotel.status === HOTEL_STATUS.REJECTED) {
+  if (registrationStatus === 'rejected') {
     return res.status(403).json({
       success: false,
       message: 'Hotel account application was rejected.',
-      hotelStatus: hotel.status
+      code: 'REGISTRATION_REJECTED',
+      registrationStatus,
+      rejectionReason: hotel.rejectionReason
+    });
+  }
+  if (registrationStatus === 'suspended' || hotel.status === HOTEL_STATUS.SUSPENDED) {
+    return res.status(403).json({
+      success: false,
+      message: 'Hotel account has been suspended. Please contact platform support.',
+      code: 'HOTEL_SUSPENDED',
+      registrationStatus
     });
   }
 
-  req.hotel = hotel;
+  if (hotel.subscriptionStatus === 'suspended') {
+    return res.status(403).json({
+      success: false,
+      message: 'Your subscription has been suspended. Contact platform support for assistance.',
+      code: 'SUBSCRIPTION_SUSPENDED',
+      subscriptionStatus: hotel.subscriptionStatus
+    });
+  }
+
+  let subscription = await Subscription.findOne({
+    hotelId: hotel._id,
+    status: { $in: ['active', 'canceled'] },
+    paymentStatus: { $ne: 'failed' },
+    endDate: { $gt: new Date() }
+  }).sort({ createdAt: -1 });
+  if (!subscription) {
+    subscription = await Subscription.findOne({ hotelId: hotel._id }).sort({ createdAt: -1 });
+  }
+  const now = new Date();
+  const paidThrough = subscription?.endDate && subscription.endDate > now;
+  const usableStatus = subscription
+    && ['active', 'canceled', 'trialing'].includes(subscription.status)
+    && subscription.paymentStatus !== 'failed'
+    && paidThrough;
+  if (!usableStatus) {
+    const status = subscription?.status || hotel.subscriptionStatus || 'not_started';
+    const expired = subscription?.endDate && subscription.endDate <= now;
+    return res.status(403).json({
+      success: false,
+      message: expired
+        ? 'Your subscription has expired. Renew your subscription to continue.'
+        : status === 'pending' || status === 'past_due'
+          ? 'Your subscription payment is pending. Complete payment to continue.'
+          : 'Choose and pay for a subscription to access hotel modules.',
+      code: expired ? 'SUBSCRIPTION_EXPIRED' : status === 'pending' ? 'PAYMENT_PENDING' : 'SUBSCRIPTION_REQUIRED',
+      subscriptionStatus: expired ? 'expired' : status
+    });
+  }
+
+  req.subscription = subscription;
+  const moduleByRoute = {
+    'room-types': ['rooms', 'frontdesk'],
+    rooms: ['rooms', 'frontdesk'],
+    reservations: ['reservations', 'frontdesk'],
+    guests: ['guests', 'frontdesk'],
+    housekeeping: 'housekeeping',
+    restaurant: 'restaurant',
+    inventory: 'inventory',
+    expenses: 'expenses',
+    maintenance: 'maintenance',
+    staff: 'staff',
+    leave: 'staff',
+    reports: 'reports',
+    ai: 'ai_assistant'
+  };
+  const moduleKeys = path === 'reports' && req.path === '/dashboard'
+    ? ['reports', 'dashboard']
+    : moduleByRoute[path] ? [moduleByRoute[path]].flat() : [];
+  if (moduleKeys.length && Array.isArray(subscription.selectedModules) && subscription.selectedModules.length) {
+    if (!moduleKeys.some((moduleKey) => subscription.selectedModules.includes(moduleKey))) {
+      const moduleKey = moduleKeys[0];
+      return res.status(403).json({
+        success: false,
+        message: `The ${moduleKey.replace(/_/g, ' ')} module is not included in your subscription.`,
+        code: 'MODULE_NOT_SUBSCRIBED',
+        module: moduleKey
+      });
+    }
+  } else if (moduleKeys.length && !subscription.planId) {
+    return res.status(403).json({
+      success: false,
+      message: `The ${moduleKeys[0].replace(/_/g, ' ')} module is not included in your subscription.`,
+      code: 'MODULE_NOT_SUBSCRIBED',
+      module: moduleKeys[0]
+    });
+  }
   next();
 };

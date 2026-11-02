@@ -16,17 +16,28 @@ export const HOTEL_STATUS = {
 };
 
 export const SUBSCRIPTION_STATUS = {
+  NOT_STARTED: 'not_started',
+  PENDING: 'pending',
   TRIALING: 'trialing',
   ACTIVE: 'active',
   PAST_DUE: 'past_due',
   CANCELED: 'canceled',
-  EXPIRED: 'expired'
+  EXPIRED: 'expired',
+  SUSPENDED: 'suspended'
+};
+
+export const REGISTRATION_STATUS = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+  SUSPENDED: 'suspended'
 };
 
 export const ROOM_STATUS = {
   AVAILABLE: 'available',
   OCCUPIED: 'occupied',
   RESERVED: 'reserved',
+  CLEANING: 'cleaning',
   OUT_OF_SERVICE: 'out_of_service'
 };
 

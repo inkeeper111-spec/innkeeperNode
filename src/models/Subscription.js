@@ -11,8 +11,16 @@ const subscriptionSchema = new mongoose.Schema({
   planId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SubscriptionPlan',
-    required: true
+    default: null
   },
+  selectedModules: [{ type: String, trim: true, lowercase: true }],
+  selectedModulePrices: [{
+    key: { type: String, required: true },
+    monthlyPrice: { type: Number, required: true, min: 0 },
+    annualPrice: { type: Number, required: true, min: 0 }
+  }],
+  moduleTotal: { type: Number, min: 0, default: 0 },
+  finalAmount: { type: Number, min: 0, default: 0 },
   status: {
     type: String,
     enum: Object.values(SUBSCRIPTION_STATUS),
@@ -39,7 +47,7 @@ const subscriptionSchema = new mongoose.Schema({
   },
   currency: {
     type: String,
-    default: 'USD'
+    default: 'INR'
   },
   paymentMethod: {
     type: String,
@@ -47,6 +55,16 @@ const subscriptionSchema = new mongoose.Schema({
   },
   razorpaySubscriptionId: String,
   razorpayPaymentId: String,
+  razorpayOrderId: { type: String, index: true },
+  paymentStatus: {
+    type: String,
+    enum: ['pending', 'paid', 'failed', 'unpaid'],
+    default: 'unpaid',
+    index: true
+  },
+  nextBillingDate: Date,
+  scheduledModuleRemovals: [{ type: String, trim: true, lowercase: true }],
+  scheduledChangesAt: Date,
   autoRenew: {
     type: Boolean,
     default: true
@@ -56,4 +74,3 @@ const subscriptionSchema = new mongoose.Schema({
 });
 
 export const Subscription = mongoose.models.Subscription || mongoose.model('Subscription', subscriptionSchema);
-

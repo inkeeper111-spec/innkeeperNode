@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
+import { HOTEL_STATUS, REGISTRATION_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 
 const attendanceLocationSchema = new mongoose.Schema({
   latitude: {
@@ -77,6 +77,29 @@ const hotelSchema = new mongoose.Schema({
     default: HOTEL_STATUS.PENDING_APPROVAL,
     index: true
   },
+  registrationStatus: {
+    type: String,
+    enum: Object.values(REGISTRATION_STATUS),
+    default() {
+      return this.status === HOTEL_STATUS.PENDING_APPROVAL
+        ? REGISTRATION_STATUS.PENDING
+        : REGISTRATION_STATUS.APPROVED;
+    },
+    index: true
+  },
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  approvedAt: { type: Date, default: null },
+  rejectedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  rejectedAt: { type: Date, default: null },
+  rejectionReason: { type: String, default: '' },
   taxNumber: {
     type: String,
     default: ''
@@ -91,11 +114,19 @@ const hotelSchema = new mongoose.Schema({
   },
   checkInTime: {
     type: String,
-    default: '14:00'
+    default: '12:00'
   },
   checkOutTime: {
     type: String,
     default: '11:00'
+  },
+  allowCustomCheckInTime: {
+    type: Boolean,
+    default: false
+  },
+  allowCustomCheckOutTime: {
+    type: Boolean,
+    default: false
   },
   cancellationPolicy: {
     type: String,
@@ -131,7 +162,7 @@ const hotelSchema = new mongoose.Schema({
   subscriptionStatus: {
     type: String,
     enum: Object.values(SUBSCRIPTION_STATUS),
-    default: SUBSCRIPTION_STATUS.TRIALING
+    default: SUBSCRIPTION_STATUS.NOT_STARTED
   },
   trialEndsAt: {
     type: Date,

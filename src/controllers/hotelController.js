@@ -1,5 +1,6 @@
-import { Hotel, Property } from '../models/index.js';
+import { Hotel, Property, Reservation } from '../models/index.js';
 import { logAudit } from '../services/auditService.js';
+import { combineHotelDateAndTime, dateOnlyFromStoredDate, isValidHotelTime } from '../utils/reservationDates.js';
 
 export const getHotelProfile = async (req, res, next) => {
   try {
@@ -23,7 +24,7 @@ export const updateHotelProfile = async (req, res, next) => {
     const allowedFields = [
       'name', 'phone', 'address', 'city', 'state', 'country', 'postalCode',
       'logo', 'taxNumber', 'currency', 'timezone', 'checkInTime', 'checkOutTime',
-      'cancellationPolicy', 'invoicePrefix'
+      'allowCustomCheckInTime', 'allowCustomCheckOutTime', 'cancellationPolicy', 'invoicePrefix'
     ];
 
     const updates = {};
@@ -31,6 +32,27 @@ export const updateHotelProfile = async (req, res, next) => {
       const value = req.body[field];
       if (value !== undefined && value !== null) {
         updates[field] = value;
+      }
+    }
+
+    for (const field of ['checkInTime', 'checkOutTime']) {
+      if (updates[field] !== undefined && !isValidHotelTime(updates[field])) {
+        return res.status(400).json({
+          success: false,
+          message: `${field === 'checkInTime' ? 'Check-in' : 'Check-out'} time must use 24-hour HH:mm format.`
+        });
+      }
+    }
+    for (const field of ['allowCustomCheckInTime', 'allowCustomCheckOutTime']) {
+      if (updates[field] !== undefined && typeof updates[field] !== 'boolean') {
+        return res.status(400).json({ success: false, message: `${field} must be true or false.` });
+      }
+    }
+    if (updates.timezone !== undefined) {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: updates.timezone }).format(new Date());
+      } catch {
+        return res.status(400).json({ success: false, message: 'Enter a valid hotel timezone.' });
       }
     }
 
@@ -74,6 +96,53 @@ export const updateHotelProfile = async (req, res, next) => {
           longitude: parsedLongitude
         };
       }
+    }
+
+    const currentHotel = await Hotel.findById(req.hotelId);
+    if (!currentHotel) {
+      return res.status(404).json({ success: false, message: 'Hotel organization not found.' });
+    }
+
+    const reservationTimingChanged = (
+      updates.checkInTime !== undefined && updates.checkInTime !== currentHotel.checkInTime
+    ) || (
+      updates.checkOutTime !== undefined && updates.checkOutTime !== currentHotel.checkOutTime
+    ) || (
+      updates.timezone !== undefined && updates.timezone !== currentHotel.timezone
+    );
+    if (reservationTimingChanged) {
+      const reservations = await Reservation.find({
+        hotelId: req.hotelId,
+        $or: [
+          { expectedCheckInAt: null },
+          { expectedCheckOutAt: null }
+        ]
+      }).select('_id checkInDate checkOutDate expectedCheckInAt expectedCheckOutAt expectedCheckInTime expectedCheckOutTime').lean();
+      const operations = reservations.map((reservation) => {
+        const checkInTime = reservation.expectedCheckInTime || currentHotel.checkInTime || '12:00';
+        const checkOutTime = reservation.expectedCheckOutTime || currentHotel.checkOutTime || '11:00';
+        const checkInDate = dateOnlyFromStoredDate(reservation.checkInDate);
+        const checkOutDate = dateOnlyFromStoredDate(reservation.checkOutDate);
+        const expectedCheckInAt = reservation.expectedCheckInAt
+          || combineHotelDateAndTime(checkInDate, checkInTime, currentHotel.timezone);
+        const expectedCheckOutAt = reservation.expectedCheckOutAt
+          || combineHotelDateAndTime(checkOutDate, checkOutTime, currentHotel.timezone);
+        return {
+          updateOne: {
+            filter: { _id: reservation._id, hotelId: req.hotelId },
+            update: {
+              $set: {
+                expectedCheckInTime: checkInTime,
+                expectedCheckOutTime: checkOutTime,
+                expectedCheckInAt,
+                expectedCheckOutAt
+              }
+            }
+          }
+        };
+      }).filter((operation) => operation.updateOne.update.$set.expectedCheckInAt
+        && operation.updateOne.update.$set.expectedCheckOutAt);
+      if (operations.length) await Reservation.bulkWrite(operations);
     }
 
     const hotel = await Hotel.findByIdAndUpdate(req.hotelId, updates, {

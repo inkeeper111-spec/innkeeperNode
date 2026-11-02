@@ -1,10 +1,11 @@
-import { Invoice, Payment, Reservation, Refund, Room } from '../models/index.js';
+import { Invoice, Payment, Reservation, Refund, Room, Subscription } from '../models/index.js';
 import { INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_METHODS, RESERVATION_STATUS, ROOM_STATUS } from '../config/constants.js';
 import { createRazorpayOrder, verifyRazorpayPayment, verifyWebhookSignature } from '../services/razorpayService.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { notifyRoles } from '../services/notificationService.js';
 import { formatCurrency } from '../utils/currency.js';
+import { completeSubscriptionPayment } from './subscriptionController.js';
 
 const applyPaymentToReservation = async (reservationId, amount, processedBy = null) => {
   if (!reservationId) return null;
@@ -452,6 +453,7 @@ export const refundPayment = async (req, res, next) => {
  * Idempotent: skips already-processed payments.
  */
 export const razorpayWebhook = async (req, res, next) => {
+  let subscriptionEvent = false;
   try {
     const signature = req.headers['x-razorpay-signature'];
     const rawBody = req.rawBody; // set by express.raw() middleware on the webhook route
@@ -467,6 +469,7 @@ export const razorpayWebhook = async (req, res, next) => {
 
     const event = req.body;
     const eventType = event.event;
+    subscriptionEvent = Boolean(event.payload?.payment?.entity?.notes?.subscriptionId);
 
     if (eventType === 'payment.captured') {
       const paymentEntity = event.payload?.payment?.entity;
@@ -478,6 +481,29 @@ export const razorpayWebhook = async (req, res, next) => {
       const razorpayOrderId   = paymentEntity.order_id;
       const amountInSubunits  = paymentEntity.amount;
       const amount            = amountInSubunits / 100;
+      const subscriptionId = paymentEntity.notes?.subscriptionId;
+
+      if (subscriptionId) {
+        const alreadyCaptured = await Payment.findOne({ razorpayPaymentId, status: 'captured' });
+        if (alreadyCaptured) return res.status(200).json({ received: true, note: 'Already processed.' });
+        const subscription = await Subscription.findOne({
+          _id: subscriptionId,
+          hotelId: paymentEntity.notes?.hotelId,
+          razorpayOrderId,
+          status: 'pending',
+          paymentStatus: 'pending'
+        });
+        if (!subscription || Math.round(subscription.finalAmount * 100) !== amountInSubunits
+          || paymentEntity.currency !== 'INR') {
+          return res.status(200).json({ received: true, note: 'Subscription payment did not match a pending order.' });
+        }
+        await completeSubscriptionPayment({
+          subscription,
+          razorpayPaymentId,
+          razorpaySignature: ''
+        });
+        return res.status(200).json({ received: true });
+      }
 
       // Idempotency: skip if already recorded
       const existing = await Payment.findOne({ razorpayPaymentId });
@@ -532,6 +558,31 @@ export const razorpayWebhook = async (req, res, next) => {
 
     if (eventType === 'payment.failed') {
       const paymentEntity = event.payload?.payment?.entity;
+      const subscriptionId = paymentEntity?.notes?.subscriptionId;
+      if (subscriptionId) {
+        const subscription = await Subscription.findOne({
+          _id: subscriptionId,
+          razorpayOrderId: paymentEntity.order_id,
+          status: 'pending'
+        });
+        if (subscription) {
+          subscription.status = 'past_due';
+          subscription.paymentStatus = 'failed';
+          await subscription.save();
+          await Payment.updateOne(
+            { subscriptionId: subscription._id, razorpayOrderId: paymentEntity.order_id },
+            { $set: { status: 'failed', notes: `Webhook: ${eventType}` } }
+          );
+          await logAudit({
+            hotelId: subscription.hotelId,
+            action: 'SUBSCRIPTION_PAYMENT_FAILED',
+            entity: 'Subscription',
+            entityId: subscription._id,
+            details: { razorpayOrderId: paymentEntity.order_id, razorpayPaymentId: paymentEntity.id }
+          });
+        }
+        return res.status(200).json({ received: true });
+      }
       const invoiceId     = paymentEntity?.notes?.invoiceId;
       if (invoiceId) {
         const invoice = await Invoice.findById(invoiceId);
@@ -555,6 +606,7 @@ export const razorpayWebhook = async (req, res, next) => {
     // Always return 200 to Razorpay to acknowledge receipt
     return res.status(200).json({ received: true });
   } catch (err) {
+    if (subscriptionEvent) return next(err);
     // Still return 200 so Razorpay does not retry indefinitely
     console.error('Webhook processing error:', err.message);
     return res.status(200).json({ received: true, error: 'Processing error logged.' });

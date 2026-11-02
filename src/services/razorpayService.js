@@ -32,6 +32,10 @@ export const createRazorpayOrder = async ({ amount, currency = 'USD', receipt, n
     });
   }
 
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Razorpay credentials are required to create payment orders in production.');
+  }
+
   // Realistic sandbox/test order simulation
   const mockOrderId = `order_${crypto.randomBytes(8).toString('hex')}`;
   return {
@@ -52,20 +56,23 @@ export const verifyRazorpayPayment = ({ orderId, paymentId, signature }) => {
       .update(`${orderId}|${paymentId}`)
       .digest('hex');
 
-    return generatedSignature === signature;
+    if (typeof signature !== 'string' || !/^[a-f0-9]{64}$/i.test(signature)) return false;
+    return crypto.timingSafeEqual(Buffer.from(generatedSignature, 'hex'), Buffer.from(signature, 'hex'));
   }
 
-  // In test/demo environment with placeholder credentials, verify that valid strings are provided
-  return Boolean(orderId && paymentId && signature);
+  return process.env.NODE_ENV !== 'production' && Boolean(orderId && paymentId && signature);
 };
 
 export const verifyWebhookSignature = (rawBody, signature) => {
-  const expectedSignature = crypto
-    .createHmac('sha256', webhookSecret)
+  if (process.env.NODE_ENV === 'production' && !process.env.RAZORPAY_WEBHOOK_SECRET) return false;
+  if (typeof signature !== 'string' || !/^[a-f0-9]{64}$/i.test(signature)) return false;
+  const activeWebhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || webhookSecret;
+  const generatedSignature = crypto
+    .createHmac('sha256', activeWebhookSecret)
     .update(rawBody)
     .digest('hex');
 
-  return expectedSignature === signature;
+  return crypto.timingSafeEqual(Buffer.from(generatedSignature, 'hex'), Buffer.from(signature, 'hex'));
 };
 
 export const processRazorpayRefund = async ({ paymentId, amount, notes = {} }) => {
@@ -86,4 +93,3 @@ export const processRazorpayRefund = async ({ paymentId, amount, notes = {} }) =
     status: 'processed'
   };
 };
-

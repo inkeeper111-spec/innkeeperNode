@@ -31,6 +31,21 @@ describe('validatePhoneFields', () => {
 
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'Digits only; the full number including country code must be 10 to 15 digits.'
+    });
+  });
+
+  it('uses the same validation message when a required phone number is missing', () => {
+    const { next, res } = runValidator({}, { path: 'phone', required: true });
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'Digits only; the full number including country code must be 10 to 15 digits.'
+    });
   });
 
   it('allows an omitted optional phone field', () => {

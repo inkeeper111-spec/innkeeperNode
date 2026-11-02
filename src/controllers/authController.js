@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { User, Hotel, Property, SubscriptionPlan, Subscription } from '../models/index.js';
+import { User, Hotel, Property, Subscription } from '../models/index.js';
 import { ROLES, HOTEL_STATUS, SUBSCRIPTION_STATUS } from '../config/constants.js';
 import { generateTokens, verifyRefreshToken } from '../utils/token.js';
 import { sendEmail } from '../services/emailService.js';
@@ -22,6 +22,11 @@ export const register = async (req, res, next) => {
       currency = 'USD'
     } = req.body;
 
+    if (![hotelName, name, email, password, phone, address, city, state, postalCode]
+      .every((value) => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ success: false, message: 'Please complete all required hotel and administrator details.' });
+    }
+
     // Check if user already exists
     const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
@@ -34,23 +39,6 @@ export const register = async (req, res, next) => {
     let counter = 1;
     while (await Hotel.findOne({ slug })) {
       slug = `${baseSlug}-${counter++}`;
-    }
-
-    // Get Starter plan for trial
-    let starterPlan = await SubscriptionPlan.findOne({ code: 'starter' });
-    if (!starterPlan) {
-      starterPlan = await SubscriptionPlan.create({
-        name: 'Starter Plan',
-        code: 'starter',
-        description: 'Ideal for boutique hotels & bed & breakfasts',
-        monthlyPrice: 49,
-        annualPrice: 490,
-        maxRooms: 20,
-        maxUsers: 5,
-        maxProperties: 1,
-        enabledModules: ['rooms', 'reservations', 'guests', 'frontdesk', 'billing', 'housekeeping', 'restaurant', 'inventory', 'expenses', 'maintenance', 'reports'],
-        aiUsageAllowance: 100
-      });
     }
 
     // Create Hotel record (Pending approval by Super Admin)
@@ -66,9 +54,8 @@ export const register = async (req, res, next) => {
       postalCode,
       currency,
       status: HOTEL_STATUS.PENDING_APPROVAL,
-      currentPlanId: starterPlan._id,
-      subscriptionStatus: SUBSCRIPTION_STATUS.TRIALING,
-      trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+      registrationStatus: 'pending',
+      subscriptionStatus: SUBSCRIPTION_STATUS.NOT_STARTED
     });
 
     // Create Main Property/Branch for the hotel
@@ -102,26 +89,11 @@ export const register = async (req, res, next) => {
     hotel.ownerId = user._id;
     await hotel.save();
 
-    // Create active subscription entry for the 14-day trial
-    await Subscription.create({
-      hotelId: hotel._id,
-      planId: starterPlan._id,
-      status: SUBSCRIPTION_STATUS.TRIALING,
-      billingCycle: 'monthly',
-      startDate: new Date(),
-      endDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
-      amount: 0,
-      paymentMethod: 'trial'
-    });
-
     const tokens = generateTokens(user);
-
-    // Store refresh token
     user.refreshTokens.push({
       token: tokens.refreshToken,
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
     });
-    user.lastLogin = new Date();
     await user.save();
 
     await logAudit({
@@ -147,16 +119,16 @@ export const register = async (req, res, next) => {
       eventId: `hotel-registered:${hotel._id}`
     });
 
-    // Send Welcome Email
-    sendEmail({
+    const approvalMessage = 'Your hotel registration has been submitted successfully. Our Super Admin team will review your application. You will receive a notification once your registration is approved.';
+    await sendEmail({
       to: user.email,
       subject: 'Welcome to Nestnn - Hotel Application Received',
-      text: `Hello ${user.name},\n\nThank you for registering ${hotel.name} with Nestnn. Your account is created and pending initial platform verification.\n\nBest regards,\nNestnn Team`
+      text: `Hello ${user.name},\n\n${approvalMessage}\n\nBest regards,\nNestnn Team`
     });
 
     res.status(201).json({
       success: true,
-      message: 'Hotel account registered successfully. Pending platform approval.',
+      message: approvalMessage,
       data: {
         user: {
           id: user._id,
@@ -170,12 +142,14 @@ export const register = async (req, res, next) => {
           id: hotel._id,
           name: hotel.name,
           slug: hotel.slug,
-          status: hotel.status
+          status: hotel.status,
+          registrationStatus: hotel.registrationStatus,
+          subscriptionStatus: hotel.subscriptionStatus
         },
         approval: {
           required: true,
-          status: hotel.status,
-          message: 'Your hotel application was submitted for Product Admin approval. You are registered as the first hotel administrator.'
+          status: hotel.registrationStatus,
+          message: approvalMessage
         },
         ...tokens
       }
@@ -219,8 +193,17 @@ export const login = async (req, res, next) => {
     }
 
     let hotel = null;
+    let currentSubscription = null;
     if (user.hotelId) {
       hotel = await Hotel.findById(user.hotelId);
+      currentSubscription = await Subscription.findOne({
+        hotelId: user.hotelId,
+        status: { $in: ['active', 'canceled'] },
+        endDate: { $gt: new Date() }
+      }).sort({ createdAt: -1 }).lean();
+      if (!currentSubscription) {
+        currentSubscription = await Subscription.findOne({ hotelId: user.hotelId }).sort({ createdAt: -1 }).lean();
+      }
     }
 
     const tokens = generateTokens(user);
@@ -266,8 +249,11 @@ export const login = async (req, res, next) => {
           name: hotel.name,
           slug: hotel.slug,
           status: hotel.status,
+          registrationStatus: hotel.registrationStatus || (hotel.status === HOTEL_STATUS.PENDING_APPROVAL ? 'pending' : 'approved'),
+          subscriptionStatus: hotel.subscriptionStatus,
           currency: hotel.currency,
-          attendanceLocation: hotel.attendanceLocation
+          attendanceLocation: hotel.attendanceLocation,
+          currentSubscription
         } : null,
         homePath: user.role === ROLES.SUPER_ADMIN
           ? '/superadmin'
@@ -353,6 +339,18 @@ export const getCurrentUser = async (req, res, next) => {
 
     if (user.hotelId) {
       hotel = await Hotel.findById(user.hotelId);
+      hotel = hotel?.toObject();
+      if (hotel) {
+        hotel.currentSubscription = await Subscription.findOne({
+          hotelId: user.hotelId,
+          status: { $in: ['active', 'canceled'] },
+          endDate: { $gt: new Date() }
+        }).sort({ createdAt: -1 }).lean();
+        if (!hotel.currentSubscription) {
+          hotel.currentSubscription = await Subscription.findOne({ hotelId: user.hotelId })
+            .sort({ createdAt: -1 }).lean();
+        }
+      }
     }
     if (user.propertyId) {
       property = await Property.findById(user.propertyId);

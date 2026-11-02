@@ -57,6 +57,22 @@ const reservationSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  expectedCheckInTime: {
+    type: String,
+    default: null
+  },
+  expectedCheckOutTime: {
+    type: String,
+    default: null
+  },
+  expectedCheckInAt: {
+    type: Date,
+    default: null
+  },
+  expectedCheckOutAt: {
+    type: Date,
+    default: null
+  },
   rooms: [reservationRoomSchema],
   adultsCount: {
     type: Number,

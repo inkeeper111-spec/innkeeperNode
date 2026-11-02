@@ -4,6 +4,7 @@ import app from '../app.js';
 import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
 import { HousekeepingTask, Reservation, Room } from '../models/index.js';
+import { getHotelLocalDate } from '../utils/reservationDates.js';
 
 let adminToken  = '';
 let receptionistToken = '';
@@ -78,6 +79,26 @@ describe('GET /api/v1/rooms/availability', () => {
       .get('/api/v1/rooms/availability?checkInDate=2030-12-10&checkOutDate=2030-12-09')
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Check-out date must be later than check-in date.');
+  });
+
+  it('should reject past, same-day, and malformed date ranges', async () => {
+    const tomorrow = new Date(`${getHotelLocalDate('America/New_York')}T00:00:00.000Z`);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const tomorrowDate = tomorrow.toISOString().slice(0, 10);
+    const cases = [
+      ['2000-01-01', '2000-01-02', 'Past dates are not allowed.'],
+      [tomorrowDate, tomorrowDate, 'Check-out date must be later than check-in date.'],
+      ['not-a-date', tomorrowDate, 'Please select a valid reservation date.']
+    ];
+
+    for (const [checkInDate, checkOutDate, message] of cases) {
+      const res = await request(app)
+        .get(`/api/v1/rooms/availability?checkInDate=${checkInDate}&checkOutDate=${checkOutDate}`)
+        .set('Authorization', ['Bearer', adminToken].join(' '));
+      expect(res.status).toBe(400);
+      expect(res.body.message).toBe(message);
+    }
   });
 
   it('only offers clean rooms that are in service', async () => {
@@ -129,6 +150,24 @@ describe('POST /api/v1/reservations', () => {
     const ci = new Date(); ci.setDate(ci.getDate() + 5);
     const co = new Date(); co.setDate(co.getDate() + 7);
 
+    const unauthorizedTimeOverride = await request(app)
+      .post('/api/v1/reservations')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        guestData: {
+          name: 'Time Override Guest',
+          phone: '+1 - 5559990001',
+          email: 'time.override@example.com'
+        },
+        checkInDate: ci.toISOString().slice(0, 10),
+        checkOutDate: co.toISOString().slice(0, 10),
+        checkInTime: '10:00',
+        rooms: [{ roomId, roomTypeId }],
+        adultsCount: 2,
+        bookingSource: 'manual'
+      });
+    expect(unauthorizedTimeOverride.status).toBe(403);
+
     const res = await request(app)
       .post('/api/v1/reservations')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -148,8 +187,26 @@ describe('POST /api/v1/reservations', () => {
     expect(res.status).toBe(201);
     expect(res.body.success).toBe(true);
     expect(res.body.data.reservation).toHaveProperty('bookingReference');
+    expect(res.body.data.reservation.bookingReference).toMatch(/^[A-Z]{3,4}-\d{8}-\d{6}-[A-F0-9]{8}$/);
+    expect(res.body.data.reservation.expectedCheckInTime).toBe('12:00');
+    expect(res.body.data.reservation.expectedCheckOutTime).toBe('11:00');
+    expect(res.body.data.reservation.expectedCheckInAt).toBeTruthy();
+    expect(res.body.data.reservation.expectedCheckOutAt).toBeTruthy();
     expect(res.body.data.invoice).toHaveProperty('invoiceNumber');
     reservationId = res.body.data.reservation._id;
+
+    const changedHotelTimes = await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ checkInTime: '13:15', checkOutTime: '10:15' });
+    expect(changedHotelTimes.status).toBe(200);
+    const existingReservation = await Reservation.findById(reservationId);
+    expect(existingReservation.expectedCheckInTime).toBe('12:00');
+    expect(existingReservation.expectedCheckOutTime).toBe('11:00');
+    await request(app)
+      .put('/api/v1/hotels')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ checkInTime: '12:00', checkOutTime: '11:00' });
   });
 
   it('should reject reservation with past check-out date', async () => {
@@ -157,12 +214,38 @@ describe('POST /api/v1/reservations', () => {
       .post('/api/v1/reservations')
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
-        guestData:    { name: 'Bad Guest', phone: '0000000000', email: 'bad@test.com' },
+        guestData:    { name: 'Bad Guest', phone: '+1 - 5559990002', email: 'bad@test.com' },
         checkInDate:  '2020-01-01',
         checkOutDate: '2020-01-01',
         rooms: [{ roomId: roomId || '000000000000000000000001', roomTypeId: roomTypeId || '000000000000000000000001' }]
       });
     expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Past dates are not allowed.');
+  });
+
+  it('should reject past dates when a reservation is updated through the API', async () => {
+    if (!reservationId) return;
+    const res = await request(app)
+      .patch(`/api/v1/reservations/${reservationId}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ checkInDate: '2000-01-01', checkOutDate: '2000-01-02' });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Past dates are not allowed.');
+  });
+
+  it('should reject same-day reservations with the date validation message', async () => {
+    const checkInDate = getHotelLocalDate('America/New_York');
+    const res = await request(app)
+      .post('/api/v1/reservations')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        guestData: { name: 'Same Day Guest', phone: '+1 - 5559990003', email: 'same-day@test.com' },
+        checkInDate,
+        checkOutDate: checkInDate,
+        rooms: [{ roomId: roomId || '000000000000000000000001', roomTypeId: roomTypeId || '000000000000000000000001' }]
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Check-out date must be later than check-in date.');
   });
 
   it('should reject reservation without rooms array', async () => {
@@ -289,11 +372,19 @@ describe('Reservation lifecycle — check-in & check-out', () => {
 
   it('should check in a confirmed reservation', async () => {
     if (!reservationId) return;
+    const missingConfirmation = await request(app)
+      .post(`/api/v1/reservations/${reservationId}/check-in`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({});
+    expect(missingConfirmation.status).toBe(400);
+
     const res = await request(app)
       .post(`/api/v1/reservations/${reservationId}/check-in`)
+      .send({ confirmed: true })
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('checked_in');
+    expect(res.body.data.checkedInAt).toBeTruthy();
   });
 
   it('should reject duplicate check-in', async () => {
@@ -345,6 +436,7 @@ describe('Reservation lifecycle — check-in & check-out', () => {
     const task = await HousekeepingTask.findOne({ reservationId: reservation._id, roomId });
     expect(task?.taskType).toBe('checkout_cleaning');
     expect(room.housekeepingStatus).toBe('dirty');
+    expect(room.roomStatus).toBe('cleaning');
 
     const duplicate = await request(app)
       .post(`/api/v1/reservations/${reservationId}/check-out`)
@@ -363,6 +455,7 @@ describe('Reservation lifecycle — check-in & check-out', () => {
       }
     }
     expect((await Room.findById(roomId)).housekeepingStatus).toBe('clean');
+    expect((await Room.findById(roomId)).roomStatus).toBe('available');
   });
 });
 
