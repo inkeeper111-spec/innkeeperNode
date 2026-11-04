@@ -163,8 +163,18 @@ export const updateTable = async (req, res, next) => {
 
 export const getMenu = async (req, res, next) => {
   try {
+    const includeUnavailable = req.query.includeUnavailable === 'true';
+    if (includeUnavailable && !['hotel_admin', 'super_admin'].includes(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only hotel administrators can view unavailable menu items.'
+      });
+    }
+
     const categories = await MenuCategory.find({ hotelId: req.hotelId, isActive: true }).sort({ displayOrder: 1 });
-    const items = await MenuItem.find({ hotelId: req.hotelId, isAvailable: true }).populate('categoryId');
+    const itemFilter = { hotelId: req.hotelId };
+    if (!includeUnavailable) itemFilter.isAvailable = true;
+    const items = await MenuItem.find(itemFilter).populate('categoryId');
 
     res.json({
       success: true,

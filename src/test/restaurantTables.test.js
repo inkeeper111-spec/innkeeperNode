@@ -41,6 +41,43 @@ afterAll(async () => {
 });
 
 describe('Restaurant table management and POS assignment', () => {
+  it('keeps unavailable items visible to admins while excluding them from POS menus', async () => {
+    const unavailable = await request(app)
+      .patch(`/api/v1/restaurant/items/${menuItemId}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ isAvailable: false });
+    expect(unavailable.status).toBe(200);
+    expect(unavailable.body.data.isAvailable).toBe(false);
+
+    const managementMenu = await request(app)
+      .get('/api/v1/restaurant/menu?includeUnavailable=true')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(managementMenu.status).toBe(200);
+    expect(managementMenu.body.data.items.find((item) => item._id === menuItemId)?.isAvailable).toBe(false);
+
+    const posMenu = await request(app)
+      .get('/api/v1/restaurant/menu')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(posMenu.body.data.items.some((item) => item._id === menuItemId)).toBe(false);
+
+    const forbiddenManagementMenu = await request(app)
+      .get('/api/v1/restaurant/menu?includeUnavailable=true')
+      .set('Authorization', ['Bearer', restaurantToken].join(' '));
+    expect(forbiddenManagementMenu.status).toBe(403);
+
+    const restored = await request(app)
+      .patch(`/api/v1/restaurant/items/${menuItemId}`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ isAvailable: true });
+    expect(restored.status).toBe(200);
+    expect(restored.body.data.isAvailable).toBe(true);
+
+    const availableAgain = await request(app)
+      .get('/api/v1/restaurant/menu')
+      .set('Authorization', ['Bearer', adminToken].join(' '));
+    expect(availableAgain.body.data.items.some((item) => item._id === menuItemId)).toBe(true);
+  });
+
   it('creates sequential tables and restricts table management to hotel admins', async () => {
     const first = await request(app)
       .post('/api/v1/restaurant/tables')
