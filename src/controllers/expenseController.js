@@ -8,7 +8,13 @@ import { notifyHotelOperations } from '../services/notificationService.js';
 export const getExpenses = async (req, res, next) => {
   try {
     const { category, status, startDate, endDate, page = 1, limit = 20 } = req.query;
-    const filter = { hotelId: req.hotelId };
+    if (req.user.role === 'super_admin' && req.hotelId && !mongoose.Types.ObjectId.isValid(req.hotelId)) {
+      return res.status(400).json({ success: false, message: 'A valid hotel ID is required.' });
+    }
+    const hotelFilter = req.user.role === 'super_admin' && !req.hotelId
+      ? {}
+      : { hotelId: req.hotelId };
+    const filter = { ...hotelFilter };
 
     if (category && category !== 'all') filter.category = category;
     if (status && status !== 'all') filter.status = status;
@@ -22,6 +28,7 @@ export const getExpenses = async (req, res, next) => {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const total = await Expense.countDocuments(filter);
     const expenses = await Expense.find(filter)
+      .populate('hotelId', 'name')
       .populate('vendorId', 'name')
       .populate('createdBy', 'name')
       .populate('approvedBy', 'name')
@@ -30,16 +37,15 @@ export const getExpenses = async (req, res, next) => {
       .limit(parseInt(limit));
 
     // Summary aggregation by category
-    const hotelObjectId = new mongoose.Types.ObjectId(String(req.hotelId));
     const categorySummary = await Expense.aggregate([
-      { $match: { hotelId: hotelObjectId, status: 'approved' } },
+      { $match: { ...hotelFilter, status: 'approved' } },
       { $group: { _id: '$category', total: { $sum: '$amount' } } }
     ]);
 
     const monthStart = dayjs().startOf('month').toDate();
     const monthEnd = dayjs().endOf('month').toDate();
     const monthlySummary = await Expense.aggregate([
-      { $match: { hotelId: hotelObjectId, status: 'approved', date: { $gte: monthStart, $lte: monthEnd } } },
+      { $match: { ...hotelFilter, status: 'approved', date: { $gte: monthStart, $lte: monthEnd } } },
       { $group: { _id: '$category', total: { $sum: '$amount' } } }
     ]);
     const monthlyTotal = monthlySummary.reduce((sum, row) => sum + row.total, 0);
@@ -62,6 +68,12 @@ export const getExpenses = async (req, res, next) => {
 
 export const createExpense = async (req, res, next) => {
   try {
+    if (req.user.role === 'super_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Platform administrators can view expenses but cannot record hotel expenses.'
+      });
+    }
     const { category, amount, date, description, vendorId, paymentMethod, receiptUrl } = req.body;
 
     const expense = await Expense.create({

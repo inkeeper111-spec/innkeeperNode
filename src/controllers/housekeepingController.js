@@ -29,8 +29,12 @@ export const getTasks = async (req, res, next) => {
 export const createTask = async (req, res, next) => {
   try {
     const { roomId, assignedTo, priority = PRIORITY.MEDIUM, taskType = 'checkout_cleaning', notes = '' } = req.body;
-    if (assignedTo && !['hotel_admin', 'receptionist'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Only hotel operations can assign a housekeeping task.' });
+    const canAssign = ['hotel_admin', 'receptionist', 'housekeeping_staff'].includes(req.user.role);
+    if (assignedTo && !canAssign) {
+      return res.status(403).json({ success: false, message: 'You are not allowed to assign a housekeeping task.' });
+    }
+    if (req.user.role === 'housekeeping_staff' && !assignedTo) {
+      return res.status(400).json({ success: false, message: 'Choose an active housekeeping employee to assign this task.' });
     }
 
     const room = await Room.findOne({ _id: roomId, hotelId: req.hotelId });
@@ -380,8 +384,8 @@ export const rejectTaskAssignment = async (req, res, next) => {
 
 export const reassignRejectedTask = async (req, res, next) => {
   try {
-    if (!['hotel_admin', 'receptionist'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Only hotel operations can reassign tasks.' });
+    if (!['hotel_admin', 'receptionist', 'housekeeping_staff'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, message: 'You are not allowed to reassign housekeeping tasks.' });
     }
     const { assignedTo } = req.body;
     const assignee = await User.findOne({

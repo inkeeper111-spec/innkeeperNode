@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
   getStaff,
+  getStaffAssignees,
   getStaffById,
   createStaff,
   updateStaff,
@@ -24,6 +25,7 @@ import {
 import { authenticate, requireTenant, authorize } from '../middlewares/auth.js';
 import { ROLES } from '../config/constants.js';
 import { validatePhoneFields } from '../middlewares/phoneValidator.js';
+import { getPermissionSettings, updateUserPermissions } from '../controllers/permissionController.js';
 
 const router = Router();
 
@@ -31,6 +33,9 @@ router.use(authenticate);
 router.use(requireTenant);
 
 // ── Staff directory ───────────────────────────────────────────────────────────
+router.get('/assignees', getStaffAssignees);
+router.get('/permissions', authorize(ROLES.HOTEL_ADMIN), getPermissionSettings);
+router.put('/:id/permissions', authorize(ROLES.HOTEL_ADMIN), updateUserPermissions);
 router.get('/',      getStaff);
 router.post('/',     authorize(ROLES.HOTEL_ADMIN), validatePhoneFields({ path: 'phone' }), createStaff);
 

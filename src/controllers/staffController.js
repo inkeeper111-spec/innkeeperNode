@@ -81,6 +81,41 @@ export const getStaff = async (req, res, next) => {
   }
 };
 
+export const getStaffAssignees = async (req, res, next) => {
+  try {
+    const allowedRoles = [
+      ROLES.RECEPTIONIST,
+      ROLES.RESTAURANT_STAFF,
+      ROLES.HOUSEKEEPING_STAFF,
+      ROLES.MAINTENANCE_STAFF
+    ];
+    const requestedRoles = String(req.query.roles || '')
+      .split(',')
+      .map((role) => role.trim())
+      .filter(Boolean);
+    if (requestedRoles.some((role) => !allowedRoles.includes(role))) {
+      return res.status(400).json({ success: false, message: 'One or more staff roles are invalid.' });
+    }
+
+    const profiles = await StaffProfile.find({ hotelId: req.hotelId })
+      .populate('userId', 'name role isActive')
+      .sort({ createdAt: -1 });
+    const staff = profiles
+      .filter(({ userId }) => (
+        userId?.isActive && (!requestedRoles.length || requestedRoles.includes(userId.role))
+      ))
+      .map(({ userId, department, designation }) => ({
+        userId: { _id: userId._id, name: userId.name, role: userId.role, isActive: userId.isActive },
+        department,
+        designation
+      }));
+
+    res.json({ success: true, data: staff });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getStaffById = async (req, res, next) => {
   try {
     const profile = await StaffProfile.findOne({ _id: req.params.id, hotelId: req.hotelId })

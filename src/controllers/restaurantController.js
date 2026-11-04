@@ -266,6 +266,89 @@ export const getOrders = async (req, res, next) => {
   }
 };
 
+export const archivePreviousDayBills = async (req, res, next) => {
+  try {
+    const propertyId = await resolveRestaurantProperty(req, res);
+    if (!propertyId) return;
+
+    const beforeDate = req.body?.beforeDate;
+    const cutoff = new Date(beforeDate);
+    if (typeof beforeDate !== 'string' || !Number.isFinite(cutoff.getTime()) || cutoff > new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid past cutoff date is required to archive previous bills.'
+      });
+    }
+    const result = await FoodOrder.updateMany({
+      hotelId: req.hotelId,
+      propertyId,
+      orderType: 'dine_in',
+      status: FOOD_ORDER_STATUS.SERVED,
+      paymentStatus: { $in: ['paid', 'transferred_to_folio'] },
+      createdAt: { $lt: cutoff },
+      archivedAt: null
+    }, {
+      $set: { archivedAt: new Date(), archivedBy: req.user._id }
+    });
+
+    await logAudit({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      userEmail: req.user.email,
+      userRole: req.user.role,
+      action: 'ARCHIVE_PREVIOUS_RESTAURANT_BILLS',
+      entity: 'FoodOrder',
+      details: { beforeDate: cutoff, archivedCount: result.modifiedCount },
+      req
+    });
+
+    res.json({
+      success: true,
+      message: `${result.modifiedCount} closed bill${result.modifiedCount === 1 ? '' : 's'} archived. Unpaid bills were not changed.`,
+      data: { archivedCount: result.modifiedCount }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const restoreArchivedBill = async (req, res, next) => {
+  try {
+    const propertyId = await resolveRestaurantProperty(req, res);
+    if (!propertyId) return;
+
+    const order = await FoodOrder.findOneAndUpdate({
+      _id: req.params.id,
+      hotelId: req.hotelId,
+      propertyId,
+      orderType: 'dine_in',
+      archivedAt: { $ne: null }
+    }, {
+      $set: { archivedAt: null, archivedBy: null }
+    }, { new: true });
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Archived table bill not found.' });
+    }
+
+    await logAudit({
+      hotelId: req.hotelId,
+      userId: req.user._id,
+      userEmail: req.user.email,
+      userRole: req.user.role,
+      action: 'RESTORE_ARCHIVED_RESTAURANT_BILL',
+      entity: 'FoodOrder',
+      entityId: order._id,
+      details: { orderNumber: order.orderNumber },
+      req
+    });
+
+    res.json({ success: true, message: 'Bill restored to the active table bills.', data: order });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const appendItemsToOpenTableOrder = async ({ req, propertyId, table, orderItems }) => {
   const existing = await FoodOrder.findOne({
     _id: table.activeOrderId,

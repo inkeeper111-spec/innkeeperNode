@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import { User, Hotel, Subscription } from '../models/index.js';
 import { ROLES, HOTEL_STATUS } from '../config/constants.js';
+import { getRequestPermissionKey, hasExplicitPermission, hasPermission } from '../services/permissions.js';
 
 export const authenticate = async (req, res, next) => {
   let decoded;
@@ -34,7 +35,14 @@ export const authorize = (...allowedRoles) => {
     if (!req.user) {
       return res.status(401).json({ success: false, message: 'Unauthorized. Please login.' });
     }
-    if (!allowedRoles.includes(req.user.role) && req.user.role !== ROLES.SUPER_ADMIN) {
+    if (
+      !allowedRoles.includes(req.user.role)
+      && req.user.role !== ROLES.SUPER_ADMIN
+      && (() => {
+        const permissionKey = getRequestPermissionKey(req);
+        return !permissionKey || !hasExplicitPermission(req.user, permissionKey);
+      })()
+    ) {
       return res.status(403).json({ success: false, message: 'Forbidden. You do not have permission for this resource.' });
     }
     next();
@@ -181,6 +189,16 @@ export const requireTenant = async (req, res, next) => {
       message: `The ${moduleKeys[0].replace(/_/g, ' ')} module is not included in your subscription.`,
       code: 'MODULE_NOT_SUBSCRIBED',
       module: moduleKeys[0]
+    });
+  }
+
+  const permissionKey = getRequestPermissionKey(req);
+  if (permissionKey && !hasPermission(req.user, permissionKey)) {
+    return res.status(403).json({
+      success: false,
+      message: 'You do not have permission to perform this action.',
+      code: 'PERMISSION_DENIED',
+      permission: permissionKey
     });
   }
   next();

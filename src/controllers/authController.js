@@ -5,6 +5,7 @@ import { generateTokens, verifyRefreshToken } from '../utils/token.js';
 import { sendEmail } from '../services/emailService.js';
 import { notifyPlatformAdmins } from '../services/notificationService.js';
 import { logAudit } from '../services/auditService.js';
+import { getEffectivePermissions, getPermissionOverrides } from '../services/permissions.js';
 
 export const register = async (req, res, next) => {
   try {
@@ -136,7 +137,9 @@ export const register = async (req, res, next) => {
           email: user.email,
           role: user.role,
           hotelId: user.hotelId,
-          propertyId: user.propertyId
+          propertyId: user.propertyId,
+          permissions: getEffectivePermissions(user),
+          permissionOverrides: getPermissionOverrides(user)
         },
         hotel: {
           id: hotel._id,
@@ -242,7 +245,9 @@ export const login = async (req, res, next) => {
           email: user.email,
           role: user.role,
           hotelId: user.hotelId,
-          propertyId: user.propertyId
+          propertyId: user.propertyId,
+          permissions: getEffectivePermissions(user),
+          permissionOverrides: getPermissionOverrides(user)
         },
         hotel: hotel ? {
           id: hotel._id,
@@ -366,7 +371,9 @@ export const getCurrentUser = async (req, res, next) => {
           role: user.role,
           phone: user.phone,
           hotelId: user.hotelId,
-          propertyId: user.propertyId
+          propertyId: user.propertyId,
+          permissions: getEffectivePermissions(user),
+          permissionOverrides: getPermissionOverrides(user)
         },
         hotel,
         property

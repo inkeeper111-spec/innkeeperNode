@@ -8,6 +8,7 @@ describe('Hotel Management System - API Integration Tests', () => {
   let superAdminToken = '';
   let hotelAdminToken = '';
   let receptionistToken = '';
+  let housekeepingToken = '';
   let testRoomId = '';
   let testRoomTypeId = '';
   let testGuestId = '';
@@ -47,6 +48,15 @@ describe('Hotel Management System - API Integration Tests', () => {
       });
     expect(recepRes.status).toBe(200);
     receptionistToken = recepRes.body.data.accessToken;
+
+    const housekeepingRes = await request(app)
+      .post('/api/v1/auth/login')
+      .send({
+        email: 'cleaning@grandregal.com',
+        password: 'StaffPassword123!'
+      });
+    expect(housekeepingRes.status).toBe(200);
+    housekeepingToken = housekeepingRes.body.data.accessToken;
   });
 
   afterAll(async () => {
@@ -246,6 +256,45 @@ describe('Hotel Management System - API Integration Tests', () => {
       expect(Array.isArray(res.body.data)).toBe(true);
     });
 
+    it('allows housekeeping staff to assign tasks only to housekeeping staff', async () => {
+      const [staffRes, roomsRes] = await Promise.all([
+        request(app)
+          .get('/api/v1/staff')
+          .set('Authorization', `Bearer ${hotelAdminToken}`),
+        request(app)
+          .get('/api/v1/rooms')
+          .set('Authorization', `Bearer ${hotelAdminToken}`)
+      ]);
+      const housekeeper = staffRes.body.data.find((employee) => (
+        employee.userId?.role === 'housekeeping_staff' && employee.userId.isActive
+      ));
+      const otherStaff = staffRes.body.data.find((employee) => (
+        employee.userId?.role !== 'housekeeping_staff' && employee.userId?.role !== 'hotel_admin'
+      ));
+      const roomId = roomsRes.body.data[0]._id;
+      expect(housekeeper).toBeDefined();
+      expect(otherStaff).toBeDefined();
+
+      const assignedRes = await request(app)
+        .post('/api/v1/housekeeping/tasks')
+        .set('Authorization', `Bearer ${housekeepingToken}`)
+        .send({ roomId, assignedTo: housekeeper.userId._id });
+      expect(assignedRes.status).toBe(201);
+      expect(String(assignedRes.body.data.assignedTo)).toBe(housekeeper.userId._id);
+
+      const invalidRes = await request(app)
+        .post('/api/v1/housekeeping/tasks')
+        .set('Authorization', `Bearer ${housekeepingToken}`)
+        .send({ roomId, assignedTo: otherStaff.userId._id });
+      expect(invalidRes.status).toBe(400);
+
+      const unassignedRes = await request(app)
+        .post('/api/v1/housekeeping/tasks')
+        .set('Authorization', `Bearer ${housekeepingToken}`)
+        .send({ roomId: testRoomId });
+      expect(unassignedRes.status).toBe(400);
+    });
+
     it('GET /api/v1/restaurant/menu returns categories and menu items', async () => {
       const res = await request(app)
         .get('/api/v1/restaurant/menu')
@@ -253,6 +302,74 @@ describe('Hotel Management System - API Integration Tests', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.categories.length).toBeGreaterThan(0);
       expect(res.body.data.items.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Expense access', () => {
+    it('lets platform administrators view all expenses without a hotel ID but prevents recording one', async () => {
+      const listRes = await request(app)
+        .get('/api/v1/expenses')
+        .set('Authorization', `Bearer ${superAdminToken}`);
+
+      expect(listRes.status).toBe(200);
+      expect(listRes.body.success).toBe(true);
+      expect(Array.isArray(listRes.body.data.expenses)).toBe(true);
+
+      const createRes = await request(app)
+        .post('/api/v1/expenses')
+        .set('Authorization', `Bearer ${superAdminToken}`)
+        .send({
+          category: 'supplies',
+          amount: 10,
+          description: 'Platform-level expense'
+        });
+
+      expect(createRes.status).toBe(403);
+      expect(createRes.body.message).toMatch(/cannot record hotel expenses/i);
+    });
+  });
+
+  describe('User permission management', () => {
+    it('lets a hotel admin override one staff member permission and enforces the change', async () => {
+      const settingsRes = await request(app)
+        .get('/api/v1/staff/permissions')
+        .set('Authorization', `Bearer ${hotelAdminToken}`);
+      expect(settingsRes.status).toBe(200);
+      expect(settingsRes.body.data.modules.length).toBeGreaterThan(0);
+
+      const receptionist = settingsRes.body.data.users.find((user) => user.role === 'receptionist');
+      expect(receptionist).toBeDefined();
+      const permissionsUrl = `/api/v1/staff/${receptionist.id}/permissions`;
+
+      try {
+        const denyRes = await request(app)
+          .put(permissionsUrl)
+          .set('Authorization', `Bearer ${hotelAdminToken}`)
+          .send({ permissionOverrides: { 'rooms.view': false } });
+        expect(denyRes.status).toBe(200);
+
+        const deniedRoomsRes = await request(app)
+          .get('/api/v1/rooms')
+          .set('Authorization', `Bearer ${receptionistToken}`);
+        expect(deniedRoomsRes.status).toBe(403);
+        expect(deniedRoomsRes.body.code).toBe('PERMISSION_DENIED');
+
+        const allowRes = await request(app)
+          .put(permissionsUrl)
+          .set('Authorization', `Bearer ${hotelAdminToken}`)
+          .send({ permissionOverrides: { 'expenses.view': true } });
+        expect(allowRes.status).toBe(200);
+
+        const allowedExpenseRes = await request(app)
+          .get('/api/v1/expenses')
+          .set('Authorization', `Bearer ${receptionistToken}`);
+        expect(allowedExpenseRes.status).toBe(200);
+      } finally {
+        await request(app)
+          .put(permissionsUrl)
+          .set('Authorization', `Bearer ${hotelAdminToken}`)
+          .send({ permissionOverrides: {} });
+      }
     });
   });
 

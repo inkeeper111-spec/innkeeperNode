@@ -4,6 +4,8 @@ import app from '../app.js';
 import { setup, teardown } from './setup.js';
 import { seedDatabase } from '../utils/seeder.js';
 import { AuditLog } from '../models/AuditLog.js';
+import { FoodOrder } from '../models/FoodOrder.js';
+import mongoose from 'mongoose';
 
 let adminToken = '';
 let restaurantToken = '';
@@ -239,21 +241,32 @@ describe('Restaurant table management and POS assignment', () => {
       });
     expect(invalidOrder.status).toBe(400);
 
-    const created = await request(app)
-      .post('/api/v1/restaurant/orders')
-      .set('Authorization', ['Bearer', adminToken].join(' '))
-      .send({
-        orderType: 'dine_in',
-        tableId: table._id,
-        items: [{ menuItemId, quantity: 1 }]
-      });
-    expect(created.status).toBe(201);
+    for (const precedingStatuses of [[], ['preparing'], ['preparing', 'ready']]) {
+      const created = await request(app)
+        .post('/api/v1/restaurant/orders')
+        .set('Authorization', ['Bearer', adminToken].join(' '))
+        .send({
+          orderType: 'dine_in',
+          tableId: table._id,
+          items: [{ menuItemId, quantity: 1 }]
+        });
+      expect(created.status).toBe(201);
 
-    const cancelled = await request(app)
-      .patch(`/api/v1/restaurant/orders/${created.body.data._id}/status`)
-      .set('Authorization', ['Bearer', adminToken].join(' '))
-      .send({ status: 'cancelled' });
-    expect(cancelled.status).toBe(200);
+      for (const status of precedingStatuses) {
+        const updated = await request(app)
+          .patch(`/api/v1/restaurant/orders/${created.body.data._id}/status`)
+          .set('Authorization', ['Bearer', adminToken].join(' '))
+          .send({ status });
+        expect(updated.status).toBe(200);
+      }
+
+      const cancelled = await request(app)
+        .patch(`/api/v1/restaurant/orders/${created.body.data._id}/status`)
+        .set('Authorization', ['Bearer', adminToken].join(' '))
+        .send({ status: 'cancelled' });
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body.data.status).toBe('cancelled');
+    }
 
     const afterCancellation = await request(app)
       .get('/api/v1/restaurant/tables')
@@ -299,5 +312,92 @@ describe('Restaurant table management and POS assignment', () => {
     const table = occupied.body.data.find((entry) => entry._id === tableId);
     expect(table.currentStatus).toBe('occupied');
     expect(String(table.activeOrderId)).toBe(first.body.data._id);
+  });
+
+  it('lets only hotel admins archive prior-day closed bills and preserves unpaid bills', async () => {
+    const tableResponse = await request(app)
+      .post('/api/v1/restaurant/tables')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ capacity: 2, name: 'Archive Test' });
+    expect(tableResponse.status).toBe(201);
+    const tableId = tableResponse.body.data._id;
+
+    const orderResponse = await request(app)
+      .post('/api/v1/restaurant/orders')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        orderType: 'dine_in',
+        tableId,
+        items: [{ menuItemId, quantity: 1 }]
+      });
+    expect(orderResponse.status).toBe(201);
+    const paidOrder = orderResponse.body.data;
+    for (const status of ['preparing', 'ready', 'served']) {
+      await request(app)
+        .patch(`/api/v1/restaurant/orders/${paidOrder._id}/status`)
+        .set('Authorization', ['Bearer', adminToken].join(' '))
+        .send({ status })
+        .expect(200);
+    }
+    await request(app)
+      .patch(`/api/v1/restaurant/orders/${paidOrder._id}/settle`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ paymentMethod: 'cash' })
+      .expect(200);
+    await FoodOrder.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(paidOrder._id) },
+      { $set: { createdAt: new Date(Date.now() - 2 * 86400000) } }
+    );
+
+    const unpaidTable = await request(app)
+      .post('/api/v1/restaurant/tables')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ capacity: 2, name: 'Unpaid Archive Test' });
+    const unpaidResponse = await request(app)
+      .post('/api/v1/restaurant/orders')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({
+        orderType: 'dine_in',
+        tableId: unpaidTable.body.data._id,
+        items: [{ menuItemId, quantity: 1 }]
+      });
+    const unpaidOrder = unpaidResponse.body.data;
+    await FoodOrder.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(unpaidOrder._id) },
+      { $set: { createdAt: new Date(Date.now() - 2 * 86400000) } }
+    );
+
+    const now = new Date();
+    const beforeDate = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    await request(app)
+      .post('/api/v1/restaurant/orders/archive-previous-day')
+      .set('Authorization', ['Bearer', restaurantToken].join(' '))
+      .send({ beforeDate })
+      .expect(403);
+
+    const archived = await request(app)
+      .post('/api/v1/restaurant/orders/archive-previous-day')
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .send({ beforeDate })
+      .expect(200);
+    expect(archived.body.data.archivedCount).toBe(1);
+
+    const savedPaidOrder = await FoodOrder.findById(paidOrder._id).lean();
+    const savedUnpaidOrder = await FoodOrder.findById(unpaidOrder._id).lean();
+    expect(savedPaidOrder.archivedAt).toBeTruthy();
+    expect(savedPaidOrder.archivedBy.toString()).toBeTruthy();
+    expect(savedUnpaidOrder.archivedAt).toBeNull();
+    expect(await AuditLog.findOne({ action: 'ARCHIVE_PREVIOUS_RESTAURANT_BILLS' })).toBeTruthy();
+
+    await request(app)
+      .patch(`/api/v1/restaurant/orders/${paidOrder._id}/restore`)
+      .set('Authorization', ['Bearer', restaurantToken].join(' '))
+      .expect(403);
+    await request(app)
+      .patch(`/api/v1/restaurant/orders/${paidOrder._id}/restore`)
+      .set('Authorization', ['Bearer', adminToken].join(' '))
+      .expect(200);
+    expect((await FoodOrder.findById(paidOrder._id).lean()).archivedAt).toBeNull();
+    expect(await AuditLog.findOne({ action: 'RESTORE_ARCHIVED_RESTAURANT_BILL' })).toBeTruthy();
   });
 });

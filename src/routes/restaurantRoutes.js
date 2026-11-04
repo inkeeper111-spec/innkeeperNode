@@ -13,6 +13,8 @@ import {
   updateOrderStatus,
   updateBillAmounts,
   settleOrder,
+  archivePreviousDayBills,
+  restoreArchivedBill,
   transferToRoomFolio
 } from '../controllers/restaurantController.js';
 import { authenticate, requireTenant, authorize } from '../middlewares/auth.js';
@@ -34,6 +36,8 @@ router.post('/orders', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), cre
 router.patch('/orders/:id/status', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), updateOrderStatus);
 router.patch('/orders/:id/bill-amounts', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), updateBillAmounts);
 router.patch('/orders/:id/settle', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), settleOrder);
+router.post('/orders/archive-previous-day', authorize(ROLES.HOTEL_ADMIN), archivePreviousDayBills);
+router.patch('/orders/:id/restore', authorize(ROLES.HOTEL_ADMIN), restoreArchivedBill);
 router.post('/orders/transfer-to-folio', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), transferToRoomFolio);
 router.get('/tables', authorize(ROLES.HOTEL_ADMIN, ROLES.RESTAURANT_STAFF), getTables);
 router.post('/tables', authorize(ROLES.HOTEL_ADMIN), createTable);

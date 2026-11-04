@@ -47,6 +47,10 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+  permissionOverrides: {
+    type: mongoose.Schema.Types.Mixed,
+    default: () => ({})
+  },
   isEmailVerified: {
     type: Boolean,
     default: false
@@ -76,4 +80,3 @@ userSchema.methods.comparePassword = async function (candidatePassword) {
 };
 
 export const User = mongoose.models.User || mongoose.model('User', userSchema);
-
