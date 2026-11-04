@@ -26,12 +26,17 @@ const inventoryItemSchema = new mongoose.Schema({
   },
   category: {
     type: String,
-    enum: ['food_beverage', 'toiletries', 'linen_cleaning', 'maintenance', 'stationery', 'other'],
+    enum: [
+      'food_beverage', 'food_ingredients', 'beverages', 'toiletries',
+      'housekeeping_supplies', 'cleaning_materials', 'maintenance',
+      'maintenance_materials', 'electrical_items', 'stationery',
+      'minibar_products', 'linen_laundry', 'linen_cleaning', 'other'
+    ],
     default: 'food_beverage'
   },
   unit: {
     type: String,
-    enum: ['kg', 'liter', 'pieces', 'boxes', 'packets', 'bottles'],
+    enum: ['kg', 'g', 'liter', 'litre', 'ml', 'pieces', 'pcs', 'box', 'boxes', 'packet', 'packets', 'bottles'],
     default: 'pieces'
   },
   currentStock: {
@@ -46,6 +51,19 @@ const inventoryItemSchema = new mongoose.Schema({
     default: 10,
     min: 0
   },
+  maxStockLevel: { type: Number, min: 0, default: null },
+  reorderQuantity: { type: Number, min: 0, default: 0 },
+  description: { type: String, trim: true, default: '' },
+  sellingPrice: { type: Number, min: 0, default: null },
+  barcode: { type: String, trim: true, default: '' },
+  trackExpiry: { type: Boolean, default: false },
+  trackBatchNumber: { type: Boolean, default: false },
+  unitConversions: {
+    type: Map,
+    of: Number,
+    default: {}
+  },
+  isActive: { type: Boolean, default: true },
   unitCost: {
     type: Number,
     required: true,
@@ -67,4 +85,3 @@ const inventoryItemSchema = new mongoose.Schema({
 inventoryItemSchema.index({ hotelId: 1, propertyId: 1, code: 1 }, { unique: true });
 
 export const InventoryItem = mongoose.models.InventoryItem || mongoose.model('InventoryItem', inventoryItemSchema);
-

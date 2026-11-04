@@ -27,7 +27,13 @@ const orderItemSchema = new mongoose.Schema({
   specialInstructions: {
     type: String,
     default: ''
-  }
+  },
+  ingredientSubstitutions: [{
+    ingredientItemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem' },
+    substituteItemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem' },
+    quantity: { type: Number, min: 0.000001 },
+    unit: { type: String, trim: true }
+  }]
 }, { _id: false });
 
 const amountModificationSchema = new mongoose.Schema({

@@ -5,6 +5,7 @@ import { logAudit } from '../services/auditService.js';
 import { formatCurrency } from '../utils/currency.js';
 import mongoose from 'mongoose';
 import { notifyRoles } from '../services/notificationService.js';
+import { consumeRecipesForOrder, runInventoryTransaction } from '../services/inventoryService.js';
 
 const resolveRestaurantProperty = async (req, res) => {
   const propertyId = req.propertyId || req.user.propertyId
@@ -461,7 +462,8 @@ export const createOrder = async (req, res, next) => {
         quantity: item.quantity,
         unitPrice: menuItem.price,
         amount: itemTotal,
-        specialInstructions: item.specialInstructions || ''
+        specialInstructions: item.specialInstructions || '',
+        ingredientSubstitutions: item.ingredientSubstitutions || []
       });
     }
 
@@ -782,27 +784,30 @@ export const settleOrder = async (req, res, next) => {
     const propertyId = await resolveRestaurantProperty(req, res);
     if (!propertyId) return;
 
-    const order = await FoodOrder.findOneAndUpdate({
-      _id: req.params.id,
-      hotelId: req.hotelId,
-      propertyId,
-      status: FOOD_ORDER_STATUS.SERVED,
-      paymentStatus: 'unpaid'
-    }, { $set: { paymentStatus: 'paid', paymentMethod: req.body.paymentMethod || 'cash' } }, { new: true });
-
-    if (!order) {
-      return res.status(409).json({
-        success: false,
-        message: 'Only served, unpaid orders can be settled.'
-      });
-    }
-
-    if (order.tableId) {
-      await RestaurantTable.updateOne(
-        { _id: order.tableId, hotelId: req.hotelId, propertyId, activeOrderId: order._id },
-        { $set: { activeOrderId: null } }
-      );
-    }
+    const order = await runInventoryTransaction(async (session) => {
+      const current = await FoodOrder.findOne({
+        _id: req.params.id,
+        hotelId: req.hotelId,
+        propertyId,
+        status: FOOD_ORDER_STATUS.SERVED,
+        paymentStatus: 'unpaid'
+      }).session(session);
+      if (!current) {
+        throw Object.assign(new Error('Only served, unpaid orders can be settled.'), { statusCode: 409 });
+      }
+      current.paymentStatus = 'paid';
+      current.paymentMethod = req.body.paymentMethod || 'cash';
+      await current.save({ session });
+      await consumeRecipesForOrder(current, session);
+      if (current.tableId) {
+        await RestaurantTable.updateOne(
+          { _id: current.tableId, hotelId: req.hotelId, propertyId, activeOrderId: current._id },
+          { $set: { activeOrderId: null } },
+          { session }
+        );
+      }
+      return current;
+    });
 
     await notifyRoles({
       hotelId: req.hotelId,
@@ -831,66 +836,57 @@ export const transferToRoomFolio = async (req, res, next) => {
     if (!propertyId) return;
     const { orderId, reservationId } = req.body;
 
-    const order = await FoodOrder.findOne({ _id: orderId, hotelId: req.hotelId, propertyId });
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Food order not found.' });
-    }
+    const result = await runInventoryTransaction(async (session) => {
+      const order = await FoodOrder.findOne({ _id: orderId, hotelId: req.hotelId, propertyId }).session(session);
+      if (!order) throw Object.assign(new Error('Food order not found.'), { statusCode: 404 });
+      if (order.isBilledToRoomFolio || order.paymentStatus !== 'unpaid'
+        || order.status !== FOOD_ORDER_STATUS.SERVED) {
+        throw Object.assign(new Error('Only served, unpaid orders can be transferred to a room folio once.'), { statusCode: 409 });
+      }
 
-    if (order.isBilledToRoomFolio) {
-      return res.status(400).json({ success: false, message: 'Order charges have already been transferred to folio.' });
-    }
+      const reservation = await Reservation.findOne({
+        _id: reservationId || order.reservationId,
+        hotelId: req.hotelId,
+        status: RESERVATION_STATUS.CHECKED_IN
+      }).session(session);
+      if (!reservation) {
+        throw Object.assign(new Error('Active in-house checked-in reservation not found for folio billing.'), { statusCode: 400 });
+      }
 
-    const reservation = await Reservation.findOne({
-      _id: reservationId || order.reservationId,
-      hotelId: req.hotelId,
-      status: RESERVATION_STATUS.CHECKED_IN
-    });
-
-    if (!reservation) {
-      return res.status(400).json({
-        success: false,
-        message: 'Active in-house checked-in reservation not found for folio billing.'
+      const invoice = await Invoice.findOne({ reservationId: reservation._id, hotelId: req.hotelId }).session(session);
+      if (!invoice) throw Object.assign(new Error('Invoice not found for this reservation.'), { statusCode: 404 });
+      invoice.items.push({
+        description: `Restaurant Order #${order.orderNumber} (${order.orderType})`,
+        quantity: 1,
+        unitPrice: order.totalAmount,
+        amount: order.totalAmount,
+        itemType: 'restaurant',
+        sourceRef: order._id.toString()
       });
-    }
+      invoice.subtotal = Math.round((invoice.subtotal + order.totalAmount) * 100) / 100;
+      invoice.totalAmount = Math.round((invoice.totalAmount + order.totalAmount) * 100) / 100;
+      invoice.balanceAmount = Math.round((invoice.totalAmount - invoice.paidAmount) * 100) / 100;
+      await invoice.save({ session });
 
-    // Find active invoice for this reservation
-    const invoice = await Invoice.findOne({ reservationId: reservation._id, hotelId: req.hotelId });
-    if (!invoice) {
-      return res.status(404).json({ success: false, message: 'Invoice not found for this reservation.' });
-    }
+      reservation.totalAmount = Math.round((reservation.totalAmount + order.totalAmount) * 100) / 100;
+      reservation.balanceAmount = Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100;
+      await reservation.save({ session });
 
-    // Append restaurant line item to the invoice
-    invoice.items.push({
-      description: `Restaurant Order #${order.orderNumber} (${order.orderType})`,
-      quantity: 1,
-      unitPrice: order.totalAmount,
-      amount: order.totalAmount,
-      itemType: 'restaurant',
-      sourceRef: order._id.toString()
+      order.isBilledToRoomFolio = true;
+      order.paymentStatus = 'transferred_to_folio';
+      order.reservationId = reservation._id;
+      await order.save({ session });
+      await consumeRecipesForOrder(order, session);
+      if (order.tableId) {
+        await RestaurantTable.updateOne(
+          { _id: order.tableId, hotelId: req.hotelId, propertyId, activeOrderId: order._id },
+          { $set: { activeOrderId: null } },
+          { session }
+        );
+      }
+      return { order, invoice, reservation };
     });
-
-    invoice.subtotal = Math.round((invoice.subtotal + order.totalAmount) * 100) / 100;
-    invoice.totalAmount = Math.round((invoice.totalAmount + order.totalAmount) * 100) / 100;
-    invoice.balanceAmount = Math.round((invoice.totalAmount - invoice.paidAmount) * 100) / 100;
-    await invoice.save();
-
-    // Update reservation total & balance
-    reservation.totalAmount = Math.round((reservation.totalAmount + order.totalAmount) * 100) / 100;
-    reservation.balanceAmount = Math.round((reservation.totalAmount - reservation.paidAmount) * 100) / 100;
-    await reservation.save();
-
-    // Mark order as billed to room folio
-    order.isBilledToRoomFolio = true;
-    order.paymentStatus = 'transferred_to_folio';
-    order.reservationId = reservation._id;
-    await order.save();
-
-    if (order.tableId && order.status === FOOD_ORDER_STATUS.SERVED) {
-      await RestaurantTable.updateOne(
-        { _id: order.tableId, hotelId: req.hotelId, propertyId, activeOrderId: order._id },
-        { $set: { activeOrderId: null } }
-      );
-    }
+    const { order, invoice, reservation } = result;
 
     await logAudit({
       hotelId: req.hotelId,

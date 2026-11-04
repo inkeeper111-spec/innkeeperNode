@@ -12,8 +12,10 @@ const poItemSchema = new mongoose.Schema({
   quantity: {
     type: Number,
     required: true,
-    min: 1
+    min: 0.000001
   },
+  receivedQuantity: { type: Number, min: 0, default: 0 },
+  unit: { type: String, default: '' },
   unitCost: {
     type: Number,
     required: true,
@@ -56,11 +58,23 @@ const purchaseOrderSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['draft', 'ordered', 'received', 'cancelled'],
+    enum: ['draft', 'pending_approval', 'approved', 'ordered', 'partially_received', 'received', 'cancelled', 'rejected'],
     default: 'draft',
     index: true
   },
   expectedDeliveryDate: Date,
+  department: { type: String, trim: true, default: '' },
+  purchaseRequestId: { type: mongoose.Schema.Types.ObjectId, ref: 'DepartmentRequest', default: null },
+  taxAmount: { type: Number, min: 0, default: 0 },
+  discountAmount: { type: Number, min: 0, default: 0 },
+  subtotal: { type: Number, min: 0, default: 0 },
+  invoiceAttachment: { type: String, default: '' },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  approvedAt: Date,
+  receivingHistory: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'GoodsReceipt'
+  }],
   receivedDate: Date,
   notes: {
     type: String,
@@ -75,4 +89,3 @@ const purchaseOrderSchema = new mongoose.Schema({
 });
 
 export const PurchaseOrder = mongoose.models.PurchaseOrder || mongoose.model('PurchaseOrder', purchaseOrderSchema);
-

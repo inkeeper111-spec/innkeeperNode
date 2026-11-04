@@ -63,6 +63,7 @@ export const DEFAULT_ROLE_PERMISSIONS = {
   [ROLES.HOUSEKEEPING_STAFF]: [
     ...permissionsFor(
       'housekeeping:view:create:update', 'rooms:view',
+      'inventory:view:create',
       'maintenance:view', 'notifications:view:update',
       'leave:view:create:update', 'staff:view',
       'staff_self:view:create:update'
@@ -71,6 +72,7 @@ export const DEFAULT_ROLE_PERMISSIONS = {
   [ROLES.MAINTENANCE_STAFF]: [
     ...permissionsFor(
       'maintenance:view:create:update',
+      'inventory:view:create',
       'notifications:view:update', 'leave:view:create:update',
       'staff:view', 'staff_self:view:create:update'
     )

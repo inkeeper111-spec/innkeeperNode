@@ -21,7 +21,11 @@ const stockMovementSchema = new mongoose.Schema({
   },
   movementType: {
     type: String,
-    enum: ['receipt', 'issue', 'adjustment', 'wastage', 'return'],
+    enum: [
+      'receipt', 'issue', 'adjustment', 'wastage', 'return', 'transfer',
+      'opening', 'department_issue', 'recipe_consumption', 'sale_reversal',
+      'physical_count', 'expiry'
+    ],
     required: true
   },
   quantity: {
@@ -55,10 +59,23 @@ const stockMovementSchema = new mongoose.Schema({
   recordedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
-  }
+  },
+  location: { type: String, trim: true, default: 'Main Store' },
+  destinationLocation: { type: String, trim: true, default: '' },
+  department: { type: String, trim: true, default: '' },
+  idempotencyKey: { type: String, default: undefined },
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'FoodOrder', default: null },
+  batchNumber: { type: String, trim: true, default: '' },
+  expiryDate: { type: Date, default: null },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} }
 }, {
   timestamps: true
 });
 
-export const StockMovement = mongoose.models.StockMovement || mongoose.model('StockMovement', stockMovementSchema);
+stockMovementSchema.index(
+  { hotelId: 1, propertyId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
+);
+stockMovementSchema.index({ hotelId: 1, propertyId: 1, createdAt: -1 });
 
+export const StockMovement = mongoose.models.StockMovement || mongoose.model('StockMovement', stockMovementSchema);

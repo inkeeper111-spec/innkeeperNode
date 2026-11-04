@@ -38,6 +38,8 @@ const vendorSchema = new mongoose.Schema({
     type: String,
     default: 'Net 30'
   },
+  outstandingBalance: { type: Number, min: 0, default: 0 },
+  suppliedItems: [{ type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem' }],
   status: {
     type: String,
     enum: ['active', 'inactive'],
@@ -48,4 +50,3 @@ const vendorSchema = new mongoose.Schema({
 });
 
 export const Vendor = mongoose.models.Vendor || mongoose.model('Vendor', vendorSchema);
-
