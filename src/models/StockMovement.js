@@ -28,10 +28,17 @@ const stockMovementSchema = new mongoose.Schema({
     ],
     required: true
   },
+  transactionDate: { type: Date, default: Date.now, index: true },
   quantity: {
     type: Number,
     required: true
   },
+  enteredQuantity: { type: Number, min: 0, default: null },
+  enteredUnit: { type: String, trim: true, default: '' },
+  enteredUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  conversionFactor: { type: Number, min: 0, default: 1 },
+  baseUnit: { type: String, trim: true, default: '' },
+  baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
   previousStock: {
     type: Number,
     required: true
@@ -64,6 +71,13 @@ const stockMovementSchema = new mongoose.Schema({
   destinationLocation: { type: String, trim: true, default: '' },
   department: { type: String, trim: true, default: '' },
   idempotencyKey: { type: String, default: undefined },
+  batchAllocations: [{
+    batchId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryBatch', default: null },
+    quantity: { type: Number, required: true, min: 0 },
+    unitCost: { type: Number, required: true, min: 0 },
+    totalCost: { type: Number, required: true, min: 0 },
+    source: { type: String, enum: ['batch', 'legacy'], default: 'batch' }
+  }],
   orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'FoodOrder', default: null },
   batchNumber: { type: String, trim: true, default: '' },
   expiryDate: { type: Date, default: null },
@@ -77,5 +91,6 @@ stockMovementSchema.index(
   { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
 );
 stockMovementSchema.index({ hotelId: 1, propertyId: 1, createdAt: -1 });
+stockMovementSchema.index({ hotelId: 1, propertyId: 1, transactionDate: -1 });
 
 export const StockMovement = mongoose.models.StockMovement || mongoose.model('StockMovement', stockMovementSchema);

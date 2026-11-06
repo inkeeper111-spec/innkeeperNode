@@ -9,6 +9,13 @@ const inventoryBatchSchema = new mongoose.Schema({
   quantity: { type: Number, required: true, min: 0 },
   remainingQuantity: { type: Number, required: true, min: 0 },
   unitCost: { type: Number, required: true, min: 0 },
+  purchaseQuantity: { type: Number, min: 0, default: null },
+  purchaseUnit: { type: String, trim: true, default: '' },
+  purchaseUnitCost: { type: Number, min: 0, default: null },
+  purchaseAmount: { type: Number, min: 0, default: null },
+  vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor', default: null },
+  purchaseOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder', default: null },
+  invoiceNumber: { type: String, trim: true, default: '' },
   expiryDate: { type: Date, default: null },
   receivedAt: { type: Date, default: Date.now }
 }, { timestamps: true });

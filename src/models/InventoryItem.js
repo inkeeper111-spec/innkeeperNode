@@ -27,7 +27,8 @@ const inventoryItemSchema = new mongoose.Schema({
   category: {
     type: String,
     enum: [
-      'food_beverage', 'food_ingredients', 'beverages', 'toiletries',
+      'food_beverage', 'food_ingredients', 'vegetables', 'fruits', 'groceries',
+      'dairy_products', 'meat', 'seafood', 'beverages', 'toiletries',
       'housekeeping_supplies', 'cleaning_materials', 'maintenance',
       'maintenance_materials', 'electrical_items', 'stationery',
       'minibar_products', 'linen_laundry', 'linen_cleaning', 'other'
@@ -36,9 +37,29 @@ const inventoryItemSchema = new mongoose.Schema({
   },
   unit: {
     type: String,
-    enum: ['kg', 'g', 'liter', 'litre', 'ml', 'pieces', 'pcs', 'box', 'boxes', 'packet', 'packets', 'bottles'],
+    trim: true,
     default: 'pieces'
   },
+  baseUnit: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  purchaseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  purchaseUnit: { type: String, trim: true, default: '' },
+  purchaseConversionFactor: { type: Number, min: 0.000000001, default: 1 },
+  conversionFactor: { type: Number, min: 0.000000001, default: 1 },
+  purchasePrice: { type: Number, min: 0, default: null },
+  packagingOptions: [{
+    unit: { type: String, trim: true, required: true },
+    unitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+    conversionFactor: { type: Number, min: 0.000000001, required: true }
+  }],
+  additionalPackagingOptions: [{
+    unitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', required: true },
+    conversionFactor: { type: Number, min: 0.000000001, required: true }
+  }],
   currentStock: {
     type: Number,
     required: true,
@@ -58,6 +79,7 @@ const inventoryItemSchema = new mongoose.Schema({
   barcode: { type: String, trim: true, default: '' },
   trackExpiry: { type: Boolean, default: false },
   trackBatchNumber: { type: Boolean, default: false },
+  stockVerificationIntervalDays: { type: Number, min: 1, max: 365, default: null },
   unitConversions: {
     type: Map,
     of: Number,
@@ -83,5 +105,11 @@ const inventoryItemSchema = new mongoose.Schema({
 });
 
 inventoryItemSchema.index({ hotelId: 1, propertyId: 1, code: 1 }, { unique: true });
+
+inventoryItemSchema.pre('validate', function setBaseUnit() {
+  if (!this.baseUnit) this.baseUnit = this.unit || 'pcs';
+  if (!this.unit) this.unit = this.baseUnit;
+  if (!this.purchaseUnit) this.purchaseUnit = this.baseUnit;
+});
 
 export const InventoryItem = mongoose.models.InventoryItem || mongoose.model('InventoryItem', inventoryItemSchema);

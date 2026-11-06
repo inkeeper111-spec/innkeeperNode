@@ -2,13 +2,17 @@ import mongoose from 'mongoose';
 
 const ingredientSchema = new mongoose.Schema({
   itemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', required: true },
-  quantity: { type: Number, required: true, min: 0.000001 },
+  quantity: { type: Number, required: true, min: 0.00000001 },
   unit: { type: String, required: true, trim: true },
+  conversionFactor: { type: Number, min: 0, default: null },
+  baseUnit: { type: String, trim: true, default: '' },
   optional: { type: Boolean, default: false },
   substitutions: [{
     itemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem' },
-    quantity: { type: Number, min: 0.000001 },
-    unit: { type: String, trim: true }
+    quantity: { type: Number, min: 0.00000001 },
+    unit: { type: String, trim: true },
+    conversionFactor: { type: Number, min: 0, default: null },
+    baseUnit: { type: String, trim: true, default: '' }
   }]
 }, { _id: false });
 

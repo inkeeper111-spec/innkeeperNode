@@ -5,6 +5,9 @@ const stockAdjustmentSchema = new mongoose.Schema({
   propertyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Property', required: true, index: true },
   itemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', required: true, index: true },
   quantity: { type: Number, required: true, min: 0 },
+  unit: { type: String, trim: true, default: '' },
+  conversionFactor: { type: Number, min: 0, default: 1 },
+  baseUnit: { type: String, trim: true, default: '' },
   reason: {
     type: String,
     required: true,

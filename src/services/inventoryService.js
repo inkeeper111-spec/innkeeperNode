@@ -1,20 +1,17 @@
 import mongoose from 'mongoose';
 import {
-  InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, RecipeConsumption, StockMovement
+  InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, RecipeConsumption, StockMovement, Unit
 } from '../models/index.js';
+import { convertQuantityToBase } from '../config/inventoryUnits.js';
 
 const round = (value) => Math.round((value + Number.EPSILON) * 10000) / 10000;
-
-const convertToBaseUnit = (item, quantity, unit) => {
-  if (!unit || unit === item.unit) return quantity;
-  const conversions = item.unitConversions instanceof Map
-    ? Object.fromEntries(item.unitConversions)
-    : item.unitConversions || {};
-  const factor = Number(conversions[unit]);
-  if (!Number.isFinite(factor) || factor <= 0) {
-    throw Object.assign(new Error(`No unit conversion is configured for ${unit} on ${item.name}.`), { statusCode: 400 });
-  }
-  return round(quantity * factor);
+const roundQuantity = (value) => Math.round((value + Number.EPSILON) * 100000000) / 100000000;
+const unitIdForSymbol = (item, symbol) => {
+  if (item.baseUnit === symbol) return item.baseUnitId || null;
+  if (item.purchaseUnit === symbol) return item.purchaseUnitId || null;
+  const packageOption = (item.packagingOptions || []).find((option) => option.unit === symbol);
+  return packageOption?.unitId || (item.additionalPackagingOptions || [])
+    .find((option) => String(option.unitId?.symbol || '') === symbol)?.unitId || null;
 };
 
 const updateBalance = async ({ hotelId, propertyId, item, location, delta, session }) => {
@@ -39,7 +36,7 @@ const updateBalance = async ({ hotelId, propertyId, item, location, delta, sessi
   if (!updated) {
     throw Object.assign(new Error(`Insufficient stock at ${location} for ${item.name}.`), { statusCode: 409 });
   }
-  return { previous: round(updated.quantity - delta), current: round(updated.quantity) };
+  return { previous: roundQuantity(updated.quantity - delta), current: roundQuantity(updated.quantity) };
 };
 
 export const postStockMovement = async ({
@@ -48,15 +45,22 @@ export const postStockMovement = async ({
   itemId,
   movementType,
   quantity,
+  unit,
+  unitId,
+  conversionFactor,
+  unitCost: unitCostOverride,
   location = 'Main Store',
   department = '',
   referenceNumber = '',
   notes = '',
   recordedBy,
+  transactionDate = null,
   idempotencyKey,
   orderId = null,
   batchNumber = '',
   expiryDate = null,
+  batchDetails = {},
+  receivedAt = null,
   metadata = {},
   session
 }) => {
@@ -73,10 +77,39 @@ export const postStockMovement = async ({
 
   const item = await InventoryItem.findOne({ _id: itemId, hotelId, propertyId, isActive: true }).session(session);
   if (!item) throw Object.assign(new Error('Active inventory item not found.'), { statusCode: 404 });
-  const delta = ['receipt', 'return', 'opening'].includes(movementType) ? numericQuantity
+  const enteredUnit = unit || item.baseUnit || item.unit;
+  const configuredUnitId = unitId || unitIdForSymbol(item, enteredUnit);
+  let enteredUnitRecord;
+  if (configuredUnitId) {
+    enteredUnitRecord = await Unit.findOne({ _id: configuredUnitId, hotelId }).session(session);
+  } else {
+    enteredUnitRecord = await Unit.findOne({
+      hotelId,
+      symbolKey: String(enteredUnit).trim().toLocaleLowerCase(),
+      ...(conversionFactor === undefined ? { isActive: true } : {})
+    }).session(session);
+  }
+  if (item.baseUnitId) {
+    const baseUnitRecord = await Unit.findOne({ _id: item.baseUnitId, hotelId }).session(session);
+    if (!enteredUnitRecord || !baseUnitRecord) {
+      throw Object.assign(new Error('Stock movement unit is not registered for this hotel.'), { statusCode: 400 });
+    }
+    if (!configuredUnitId && enteredUnitRecord.category !== baseUnitRecord.category) {
+      throw Object.assign(new Error('Stock movement units must be compatible with the inventory item base unit.'), { statusCode: 400 });
+    }
+  }
+  const converted = convertQuantityToBase(item, numericQuantity, enteredUnit, conversionFactor);
+  const enteredUnitId = enteredUnitRecord?._id || configuredUnitId || null;
+  const baseQuantity = roundQuantity(converted.quantity);
+  const locationBalance = isStockCount
+    ? await InventoryBalance.findOne({ hotelId, propertyId, itemId: item._id, location }).session(session)
+    : null;
+  const currentLocationStock = locationBalance?.quantity ?? (location === 'Main Store' ? item.currentStock : 0);
+  const delta = ['receipt', 'return', 'opening'].includes(movementType) ? baseQuantity
     : movementType === 'adjustment' || movementType === 'physical_count'
-      ? numericQuantity - item.currentStock
-      : -numericQuantity;
+      ? baseQuantity - currentLocationStock
+      : -baseQuantity;
+  const receiptUnitCost = Number.isFinite(Number(unitCostOverride)) ? Number(unitCostOverride) : item.unitCost;
   if (delta > 0 && item.trackExpiry && !expiryDate) {
     throw Object.assign(new Error(`An expiry date is required for ${item.name}.`), { statusCode: 400 });
   }
@@ -85,10 +118,11 @@ export const postStockMovement = async ({
   }
 
   let batchesToDeduct = [];
+  let batchAllocations = [];
   const hasExpiryBatches = delta < 0 && await InventoryBatch.exists({
     hotelId, propertyId, itemId: item._id, location, expiryDate: { $ne: null }
   }).session(session);
-  if (delta < 0 && (item.trackExpiry || item.trackBatchNumber || hasExpiryBatches || movementType === 'expiry')) {
+  if (delta < 0) {
     const now = new Date();
     const batchFilter = {
       hotelId,
@@ -101,10 +135,11 @@ export const postStockMovement = async ({
         : { $or: [{ expiryDate: null }, { expiryDate: { $gt: now } }] })
     };
     batchesToDeduct = await InventoryBatch.find(batchFilter)
-      .sort({ expiryDate: 1, receivedAt: 1 })
+      .sort({ receivedAt: 1, _id: 1 })
       .session(session);
     const usableQuantity = batchesToDeduct.reduce((sum, batch) => sum + batch.remainingQuantity, 0);
-    if (usableQuantity < Math.abs(delta)) {
+    if ((item.trackExpiry || item.trackBatchNumber || hasExpiryBatches || movementType === 'expiry')
+      && usableQuantity < Math.abs(delta)) {
       throw Object.assign(new Error(
         movementType === 'expiry'
           ? `Expired batch stock for ${item.name} is less than the adjustment quantity.`
@@ -113,7 +148,7 @@ export const postStockMovement = async ({
     }
   }
   const previousStock = item.currentStock;
-  const nextStock = round(previousStock + delta);
+  const nextStock = roundQuantity(previousStock + delta);
   if (nextStock < 0) {
     throw Object.assign(new Error(`Insufficient stock. Current stock is ${previousStock} ${item.unit}.`), { statusCode: 409 });
   }
@@ -134,6 +169,7 @@ export const postStockMovement = async ({
     hotelId, propertyId, item, location, delta, session
   });
   let remainingToDeduct = Math.abs(delta);
+  let movementTotalValue = 0;
   for (const batch of batchesToDeduct) {
     if (remainingToDeduct <= 0) break;
     const deduction = Math.min(batch.remainingQuantity, remainingToDeduct);
@@ -144,7 +180,27 @@ export const postStockMovement = async ({
     if (updatedBatch.modifiedCount !== 1) {
       throw Object.assign(new Error('Inventory batch changed concurrently; retry the stock operation.'), { statusCode: 409 });
     }
-    remainingToDeduct = round(remainingToDeduct - deduction);
+    const allocationCost = round(deduction * batch.unitCost);
+    batchAllocations.push({
+      batchId: batch._id,
+      quantity: deduction,
+      unitCost: batch.unitCost,
+      totalCost: allocationCost,
+      source: 'batch'
+    });
+    movementTotalValue += allocationCost;
+    remainingToDeduct = roundQuantity(remainingToDeduct - deduction);
+  }
+  if (remainingToDeduct > 0) {
+    const legacyCost = round(remainingToDeduct * item.unitCost);
+    batchAllocations.push({
+      batchId: null,
+      quantity: remainingToDeduct,
+      unitCost: item.unitCost,
+      totalCost: legacyCost,
+      source: 'legacy'
+    });
+    movementTotalValue += legacyCost;
   }
   if (delta > 0) {
     await InventoryBatch.create([{
@@ -155,20 +211,28 @@ export const postStockMovement = async ({
       batchNumber,
       quantity: delta,
       remainingQuantity: delta,
-      unitCost: item.unitCost,
-      expiryDate
+      unitCost: receiptUnitCost,
+      expiryDate,
+      ...batchDetails,
+      ...(receivedAt ? { receivedAt } : {})
     }], { session });
   }
+  if (delta >= 0) movementTotalValue = round(Math.abs(delta) * receiptUnitCost);
+  else movementTotalValue = round(movementTotalValue);
+  const movementUnitCost = Math.abs(delta) > 0
+    ? round(movementTotalValue / Math.abs(delta))
+    : receiptUnitCost;
   const movement = await StockMovement.create([{
     hotelId,
     propertyId,
     itemId: item._id,
     movementType,
-    quantity: round(Math.abs(delta)),
+    transactionDate: transactionDate || new Date(),
+    quantity: roundQuantity(Math.abs(delta)),
     previousStock,
     newStock: nextStock,
-    unitCost: item.unitCost,
-    totalValue: round(Math.abs(delta) * item.unitCost),
+    unitCost: movementUnitCost,
+    totalValue: movementTotalValue,
     referenceNumber,
     notes,
     recordedBy,
@@ -178,6 +242,13 @@ export const postStockMovement = async ({
     orderId,
     batchNumber,
     expiryDate,
+    batchAllocations,
+    enteredQuantity: numericQuantity,
+    enteredUnit: converted.unit,
+    enteredUnitId,
+    conversionFactor: converted.factor,
+    baseUnit: item.baseUnit || item.unit,
+    baseUnitId: item.baseUnitId || null,
     metadata: { ...metadata, locationPreviousStock: balanceMovement.previous, locationNewStock: balanceMovement.current }
   }], { session }).then(([created]) => created);
 
@@ -198,11 +269,11 @@ export const runInventoryTransaction = async (operation) => {
 };
 
 export const transferStock = async ({
-  hotelId, propertyId, itemId, quantity, fromLocation, toLocation, department = '',
+  hotelId, propertyId, itemId, quantity, unit, conversionFactor, fromLocation, toLocation, department = '',
   recordedBy, referenceNumber, idempotencyKey, notes = '', session
 }) => {
-  const qty = Number(quantity);
-  if (!Number.isFinite(qty) || qty <= 0 || !fromLocation || !toLocation || fromLocation === toLocation) {
+  const enteredQuantity = Number(quantity);
+  if (!Number.isFinite(enteredQuantity) || enteredQuantity <= 0 || !fromLocation || !toLocation || fromLocation === toLocation) {
     throw Object.assign(new Error('Transfer requires a positive quantity and two different stock locations.'), { statusCode: 400 });
   }
   const existing = idempotencyKey
@@ -212,9 +283,11 @@ export const transferStock = async ({
 
   const item = await InventoryItem.findOne({ _id: itemId, hotelId, propertyId, isActive: true }).session(session);
   if (!item) throw Object.assign(new Error('Active inventory item not found.'), { statusCode: 404 });
+  const converted = convertQuantityToBase(item, enteredQuantity, unit || item.baseUnit || item.unit, conversionFactor);
+  const qty = roundQuantity(converted.quantity);
   const allSourceBatches = await InventoryBatch.find({
     hotelId, propertyId, itemId: item._id, location: fromLocation, remainingQuantity: { $gt: 0 }
-  }).sort({ expiryDate: 1, receivedAt: 1 }).session(session);
+  }).sort({ receivedAt: 1, _id: 1 }).session(session);
   const now = new Date();
   const hasExpiryBatches = allSourceBatches.some((batch) => Boolean(batch.expiryDate));
   const sourceBatches = item.trackExpiry || hasExpiryBatches
@@ -253,10 +326,12 @@ export const transferStock = async ({
       expiryDate: batch.expiryDate,
       receivedAt: batch.receivedAt
     }], { session });
-    batchQuantityToMove = round(batchQuantityToMove - movedQuantity);
+    batchQuantityToMove = roundQuantity(batchQuantityToMove - movedQuantity);
   }
   const common = {
     hotelId, propertyId, itemId: item._id, movementType: 'transfer', quantity: qty,
+    enteredQuantity, enteredUnit: converted.unit, conversionFactor: converted.factor,
+    baseUnit: item.baseUnit || item.unit,
     previousStock: item.currentStock, newStock: item.currentStock,
     unitCost: item.unitCost, totalValue: round(qty * item.unitCost), referenceNumber,
     notes, recordedBy, department,
@@ -315,26 +390,28 @@ export const consumeRecipesForOrder = async (order, session) => {
       }
       const consumedItemId = selectedSubstitution?.itemId || ingredient.itemId;
       const unit = selectedSubstitution?.unit || ingredient.unit;
+      const enteredQuantity = (selectedSubstitution?.quantity ?? ingredient.quantity) * soldLine.quantity;
+      const conversionFactor = selectedSubstitution?.conversionFactor ?? ingredient.conversionFactor;
       const itemId = String(consumedItemId);
       const item = await InventoryItem.findOne({
         _id: consumedItemId, hotelId: order.hotelId, propertyId: order.propertyId, isActive: true
       }).session(session);
       if (!item) throw Object.assign(new Error('A recipe ingredient is no longer an active inventory item.'), { statusCode: 409 });
-      const quantity = convertToBaseUnit(
-        item,
-        (selectedSubstitution?.quantity ?? ingredient.quantity) * soldLine.quantity,
-        unit
-      );
+      const converted = convertQuantityToBase(item, enteredQuantity, unit, conversionFactor || undefined);
+      const quantity = roundQuantity(converted.quantity);
       const source = {
         menuItemId: soldLine.menuItemId,
         menuItemName: soldLine.name,
         version: recipe.version,
         quantity,
-        unit: item.unit
+        unit: item.baseUnit || item.unit,
+        enteredQuantity,
+        enteredUnit: converted.unit,
+        conversionFactor: converted.factor
       };
       const prior = required.get(itemId);
       if (prior) {
-        prior.quantity = round(prior.quantity + quantity);
+        prior.quantity = roundQuantity(prior.quantity + quantity);
         prior.sources.push(source);
       } else {
         required.set(itemId, {
@@ -347,7 +424,7 @@ export const consumeRecipesForOrder = async (order, session) => {
 
   const entries = [];
   for (const requirement of required.values()) {
-    await postStockMovement({
+    const movementResult = await postStockMovement({
       hotelId: order.hotelId,
       propertyId: order.propertyId,
       itemId: requirement.item._id,
@@ -363,7 +440,12 @@ export const consumeRecipesForOrder = async (order, session) => {
       metadata: { recipeSources: requirement.sources },
       session
     });
-    for (const source of requirement.sources) {
+    let remainingCost = movementResult.movement.totalValue;
+    for (const [index, source] of requirement.sources.entries()) {
+      const sourceCost = index === requirement.sources.length - 1
+        ? round(remainingCost)
+        : round(movementResult.movement.totalValue * (source.quantity / requirement.quantity));
+      remainingCost = round(remainingCost - sourceCost);
       entries.push({
         itemId: requirement.item._id,
         menuItemId: source.menuItemId,
@@ -371,8 +453,12 @@ export const consumeRecipesForOrder = async (order, session) => {
         recipeVersion: source.version,
         quantity: source.quantity,
         unit: source.unit,
-        unitCost: requirement.item.unitCost,
-        totalCost: round(source.quantity * requirement.item.unitCost)
+        enteredQuantity: source.enteredQuantity,
+        enteredUnit: source.enteredUnit,
+        conversionFactor: source.conversionFactor,
+        baseUnit: source.unit,
+        unitCost: source.quantity > 0 ? round(sourceCost / source.quantity) : 0,
+        totalCost: sourceCost
       });
     }
   }

@@ -15,6 +15,13 @@ import {
   receivePurchaseOrderGoods
 } from '../controllers/inventoryController.js';
 import {
+  createDefaultInventoryUnits,
+  createInventoryUnit,
+  deleteInventoryUnit,
+  getInventoryUnits,
+  updateInventoryUnit
+} from '../controllers/inventoryUnitController.js';
+import {
   approvePurchaseOrder,
   assignMinibarStock,
   createDepartmentRequest,
@@ -31,6 +38,10 @@ import {
   getStockLedger,
   getStockLocations,
   getStockAdjustments,
+  createStockVerification,
+  getStockVerifications,
+  getInventorySettings,
+  updateInventorySettings,
   reviewDepartmentRequest,
   saveRecipe,
   reviewStockAdjustment,
@@ -47,10 +58,19 @@ router.use(authenticate);
 router.use(requireTenant);
 
 router.get('/items', getInventoryItems);
+router.get('/units', getInventoryUnits);
+router.post('/units', authorize(ROLES.HOTEL_ADMIN), createInventoryUnit);
+router.post('/units/defaults', authorize(ROLES.HOTEL_ADMIN), createDefaultInventoryUnits);
+router.patch('/units/:id', authorize(ROLES.HOTEL_ADMIN), updateInventoryUnit);
+router.delete('/units/:id', authorize(ROLES.HOTEL_ADMIN), deleteInventoryUnit);
 router.post('/items', authorize(ROLES.HOTEL_ADMIN), createInventoryItem);
 router.patch('/items/:id', authorize(ROLES.HOTEL_ADMIN), updateInventoryItem);
 router.post('/movements', recordStockMovement);
 router.get('/dashboard', getInventoryDashboard);
+router.get('/settings', getInventorySettings);
+router.patch('/settings', authorize(ROLES.HOTEL_ADMIN), updateInventorySettings);
+router.get('/verifications', getStockVerifications);
+router.post('/verifications', createStockVerification);
 router.get('/locations', getStockLocations);
 router.post('/transfers', authorize(ROLES.HOTEL_ADMIN), transferStockBetweenLocations);
 router.get('/ledger', getStockLedger);

@@ -2,9 +2,14 @@ import mongoose from 'mongoose';
 
 const requestLineSchema = new mongoose.Schema({
   itemId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', required: true },
-  quantity: { type: Number, required: true, min: 0.000001 },
+  quantity: { type: Number, required: true, min: 0.00000001 },
+  baseQuantity: { type: Number, min: 0.00000001, default: null },
   issuedQuantity: { type: Number, min: 0, default: 0 },
-  unit: { type: String, trim: true, default: '' }
+  issuedEnteredQuantity: { type: Number, min: 0, default: null },
+  issuedUnit: { type: String, trim: true, default: '' },
+  issuedConversionFactor: { type: Number, min: 0, default: 1 },
+  unit: { type: String, trim: true, default: '' },
+  conversionFactor: { type: Number, min: 0, default: 1 }
 }, { _id: false });
 
 const departmentRequestSchema = new mongoose.Schema({

@@ -12,10 +12,14 @@ const poItemSchema = new mongoose.Schema({
   quantity: {
     type: Number,
     required: true,
-    min: 0.000001
+    min: 0.00000001
   },
   receivedQuantity: { type: Number, min: 0, default: 0 },
   unit: { type: String, default: '' },
+  unitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  conversionFactor: { type: Number, min: 0.000000001, default: 1 },
+  baseUnit: { type: String, default: '' },
+  baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
   unitCost: {
     type: Number,
     required: true,

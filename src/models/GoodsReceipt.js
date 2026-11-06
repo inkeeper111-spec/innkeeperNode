@@ -6,6 +6,11 @@ const goodsReceiptLineSchema = new mongoose.Schema({
   acceptedQuantity: { type: Number, required: true, min: 0 },
   damagedQuantity: { type: Number, required: true, min: 0, default: 0 },
   rejectedQuantity: { type: Number, required: true, min: 0, default: 0 },
+  unit: { type: String, trim: true, default: '' },
+  unitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  conversionFactor: { type: Number, min: 0, default: 1 },
+  baseUnit: { type: String, trim: true, default: '' },
+  baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
   batchNumber: { type: String, trim: true, default: '' },
   expiryDate: { type: Date, default: null },
   unitCost: { type: Number, required: true, min: 0 }

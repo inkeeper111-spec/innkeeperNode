@@ -7,6 +7,10 @@ const consumedIngredientSchema = new mongoose.Schema({
   recipeVersion: { type: Number, required: true },
   quantity: { type: Number, required: true, min: 0 },
   unit: { type: String, required: true },
+  enteredQuantity: { type: Number, min: 0, default: null },
+  enteredUnit: { type: String, trim: true, default: '' },
+  conversionFactor: { type: Number, min: 0, default: 1 },
+  baseUnit: { type: String, trim: true, default: '' },
   unitCost: { type: Number, required: true, min: 0 },
   totalCost: { type: Number, required: true, min: 0 }
 }, { _id: false });

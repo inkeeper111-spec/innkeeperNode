@@ -1,10 +1,132 @@
-import { GoodsReceipt, InventoryBatch, InventoryItem, SupplierPayment, Vendor, PurchaseOrder } from '../models/index.js';
+import {
+  DepartmentRequest, GoodsReceipt, InventoryBatch, InventoryItem, InventoryRecipe, Unit,
+  MinibarStock, MinibarTransaction, StockMovement, SupplierPayment, Vendor, PurchaseOrder
+} from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { notifyHotelOperations, notifyRoles } from '../services/notificationService.js';
 import { postStockMovement, runInventoryTransaction } from '../services/inventoryService.js';
+import {
+  getItemUnitConfiguration, getUnitConversionFactor, normalizeInventoryUnit
+} from '../config/inventoryUnits.js';
 
 const isAdministrator = (user) => ['hotel_admin', 'super_admin'].includes(user?.role);
+const unitConfigurationError = (message) => Object.assign(new Error(message), { statusCode: 400 });
+
+const resolveItemUnits = async ({
+  hotelId,
+  baseUnitId,
+  purchaseUnitId,
+  conversionFactor,
+  additionalPackagingOptions = []
+}) => {
+  if (!baseUnitId || !purchaseUnitId) {
+    throw unitConfigurationError('Choose a base unit and purchase unit for this raw material.');
+  }
+  if (!Array.isArray(additionalPackagingOptions)) {
+    throw unitConfigurationError('Additional packaging options must be a list of configured units.');
+  }
+  const requestedIds = [baseUnitId, purchaseUnitId, ...additionalPackagingOptions.map((option) => option.unitId)]
+    .filter(Boolean)
+    .map(String);
+  const uniqueIds = [...new Set(requestedIds)];
+  const units = await Unit.find({
+    hotelId,
+    _id: { $in: uniqueIds },
+    isActive: true
+  });
+  const unitsById = new Map(units.map((unit) => [String(unit._id), unit]));
+  const baseUnit = unitsById.get(String(baseUnitId));
+  const purchaseUnit = unitsById.get(String(purchaseUnitId));
+  if (!baseUnit || !purchaseUnit) {
+    throw unitConfigurationError('Base and purchase units must be active units belonging to this hotel.');
+  }
+
+  const packagingOptions = [];
+  const seenUnits = new Set([String(baseUnit._id), String(purchaseUnit._id)]);
+  for (const option of additionalPackagingOptions) {
+    const unit = unitsById.get(String(option.unitId));
+    const factor = Number(option.conversionFactor);
+    if (!unit || !Number.isFinite(factor) || factor <= 0) {
+      throw unitConfigurationError('Each additional packaging unit must be active and have a conversion factor greater than zero.');
+    }
+    if (seenUnits.has(String(unit._id))) {
+      throw unitConfigurationError(`Unit "${unit.name}" is configured more than once.`);
+    }
+    if (unit.category === baseUnit.category) {
+      let standardFactor = null;
+      try {
+        standardFactor = getUnitConversionFactor({ baseUnit: baseUnit.symbol, unit: baseUnit.symbol }, unit.symbol);
+      } catch (error) {
+        if (error.statusCode !== 400) throw error;
+      }
+      if (standardFactor && Math.abs(factor - standardFactor) > 1e-9) {
+        throw unitConfigurationError(`Conversion for ${unit.name} must use the standard conversion to ${baseUnit.name}.`);
+      }
+    }
+    seenUnits.add(String(unit._id));
+    packagingOptions.push({ unit: unit.symbol, unitId: unit._id, conversionFactor: factor });
+  }
+
+  const suppliedFactor = conversionFactor === '' || conversionFactor === null || conversionFactor === undefined
+    ? null
+    : Number(conversionFactor);
+  if (suppliedFactor !== null && (!Number.isFinite(suppliedFactor) || suppliedFactor <= 0)) {
+    throw unitConfigurationError('Conversion factor must be greater than zero.');
+  }
+
+  let purchaseConversionFactor = 1;
+  if (String(purchaseUnit._id) !== String(baseUnit._id)) {
+    const packageFactor = packagingOptions.find((option) => String(option.unitId) === String(purchaseUnit._id))?.conversionFactor;
+    let standardFactor = null;
+    try {
+      standardFactor = baseUnit.category === purchaseUnit.category
+        ? getUnitConversionFactor({ baseUnit: baseUnit.symbol, unit: baseUnit.symbol }, purchaseUnit.symbol)
+        : null;
+      purchaseConversionFactor = packageFactor || suppliedFactor || standardFactor;
+    } catch (error) {
+      if (error.statusCode !== 400) throw error;
+      purchaseConversionFactor = packageFactor || suppliedFactor || null;
+    }
+    if (!Number.isFinite(Number(purchaseConversionFactor)) || Number(purchaseConversionFactor) <= 0) {
+      throw unitConfigurationError(
+        `Enter a product-specific conversion factor for ${purchaseUnit.name} to ${baseUnit.name}.`
+      );
+    }
+    if (packageFactor && suppliedFactor && Math.abs(packageFactor - suppliedFactor) > 1e-9) {
+      throw unitConfigurationError('Purchase conversion factor must match the configured packaging option.');
+    }
+    if (standardFactor && suppliedFactor && Math.abs(standardFactor - suppliedFactor) > 1e-9) {
+      throw unitConfigurationError('Purchase conversion factor must match the standard unit conversion.');
+    }
+    if (baseUnit.category !== purchaseUnit.category && !packageFactor && suppliedFactor === null) {
+      throw unitConfigurationError('Units from different categories require an explicit item-specific conversion factor.');
+    }
+  } else if (suppliedFactor !== null && Math.abs(suppliedFactor - 1) > 1e-9) {
+    throw unitConfigurationError('A unit converted to itself must use a factor of 1.');
+  }
+
+  const unitConversions = Object.fromEntries(packagingOptions.map((option) => [option.unit, option.conversionFactor]));
+  if (purchaseUnit.symbol !== baseUnit.symbol) {
+    unitConversions[purchaseUnit.symbol] = Number(purchaseConversionFactor);
+  }
+  return {
+    unit: baseUnit.symbol,
+    baseUnit: baseUnit.symbol,
+    baseUnitId: baseUnit._id,
+    baseUnitCategory: baseUnit.category,
+    purchaseUnit: purchaseUnit.symbol,
+    purchaseUnitId: purchaseUnit._id,
+    purchaseConversionFactor: Number(purchaseConversionFactor),
+    conversionFactor: Number(purchaseConversionFactor),
+    packagingOptions,
+    additionalPackagingOptions: packagingOptions.map(({ unitId, conversionFactor: factor }) => ({
+      unitId,
+      conversionFactor: factor
+    })),
+    unitConversions
+  };
+};
 
 export const getInventoryItems = async (req, res, next) => {
   try {
@@ -36,6 +158,10 @@ export const getInventoryItems = async (req, res, next) => {
     const [items, total] = await Promise.all([
       InventoryItem.find(filter)
       .populate('vendorId', 'name contactPerson phone')
+      .populate('baseUnitId', 'name symbol category isActive')
+      .populate('purchaseUnitId', 'name symbol category isActive')
+      .populate('additionalPackagingOptions.unitId', 'name symbol category isActive')
+      .populate('packagingOptions.unitId', 'name symbol category isActive')
       .sort({ [sortField]: sortDirection })
       .skip((pageNumber - 1) * pageSize)
       .limit(pageSize)
@@ -63,7 +189,9 @@ export const updateInventoryItem = async (req, res, next) => {
     const allowedFields = [
       'name', 'code', 'category', 'description', 'unit', 'unitCost', 'sellingPrice',
       'minStockThreshold', 'maxStockLevel', 'reorderQuantity', 'vendorId', 'barcode',
-      'trackExpiry', 'trackBatchNumber', 'unitConversions', 'isActive', 'location'
+      'trackExpiry', 'trackBatchNumber', 'unitConversions', 'isActive', 'location',
+      'stockVerificationIntervalDays',
+      'baseUnit', 'purchaseUnit', 'purchaseConversionFactor', 'purchasePrice', 'packagingOptions'
     ];
     const updates = Object.fromEntries(
       Object.entries(req.body).filter(([field]) => allowedFields.includes(field))
@@ -75,6 +203,86 @@ export const updateInventoryItem = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Item name cannot be empty.' });
     }
     if (updates.code !== undefined) updates.code = String(updates.code).trim().toUpperCase();
+    const currentItem = await InventoryItem.findOne({
+      _id: req.params.id, hotelId: req.hotelId, propertyId: req.propertyId
+    });
+    if (!currentItem) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    if (updates.unit !== undefined && updates.baseUnit === undefined) updates.baseUnit = updates.unit;
+    if (updates.baseUnit !== undefined && updates.unit === undefined) updates.unit = updates.baseUnit;
+    if (updates.baseUnit !== undefined
+      && normalizeInventoryUnit(updates.baseUnit) !== normalizeInventoryUnit(currentItem.baseUnit || currentItem.unit)) {
+      const hasHistory = currentItem.currentStock > 0
+        || await StockMovement.exists({ itemId: currentItem._id, hotelId: req.hotelId, propertyId: req.propertyId })
+        || await InventoryRecipe.exists({
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          $or: [{ 'ingredients.itemId': currentItem._id }, { 'ingredients.substitutions.itemId': currentItem._id }]
+        })
+        || await PurchaseOrder.exists({
+          hotelId: req.hotelId, propertyId: req.propertyId, 'items.itemId': currentItem._id
+        })
+        || await DepartmentRequest.exists({
+          hotelId: req.hotelId, propertyId: req.propertyId, 'lines.itemId': currentItem._id
+        })
+        || await MinibarStock.exists({ hotelId: req.hotelId, propertyId: req.propertyId, itemId: currentItem._id })
+        || await MinibarTransaction.exists({ hotelId: req.hotelId, propertyId: req.propertyId, itemId: currentItem._id });
+      if (hasHistory) {
+        return res.status(409).json({ success: false, message: 'Base unit cannot be changed after stock or recipe history exists. Create a new item and transfer stock instead.' });
+      }
+    }
+    if (['unit', 'baseUnit', 'purchaseUnit', 'purchaseConversionFactor', 'unitConversions', 'packagingOptions'].some((field) => updates[field] !== undefined)) {
+      const baseUnit = updates.baseUnit || currentItem.baseUnit || currentItem.unit;
+      const purchaseUnit = updates.purchaseUnit || currentItem.purchaseUnit || baseUnit;
+      const storedConversions = currentItem.unitConversions instanceof Map
+        ? Object.fromEntries(currentItem.unitConversions)
+        : currentItem.unitConversions?.toObject?.() || currentItem.unitConversions || {};
+      let packagingOptions = updates.packagingOptions || currentItem.packagingOptions || [];
+      if (updates.purchaseConversionFactor !== undefined && updates.packagingOptions === undefined) {
+        packagingOptions = packagingOptions.map((option) => (
+          normalizeInventoryUnit(option.unit) === normalizeInventoryUnit(purchaseUnit)
+            ? {
+              ...(typeof option.toObject === 'function' ? option.toObject() : option),
+              conversionFactor: Number(updates.purchaseConversionFactor)
+            }
+            : option
+        ));
+      }
+      const packageFactor = packagingOptions.find((option) => (
+        normalizeInventoryUnit(option.unit) === normalizeInventoryUnit(purchaseUnit)
+      ))?.conversionFactor;
+      const unitConversions = updates.unitConversions ?? (
+        updates.purchaseConversionFactor !== undefined && normalizeInventoryUnit(purchaseUnit) !== normalizeInventoryUnit(baseUnit)
+          ? { ...storedConversions, [normalizeInventoryUnit(purchaseUnit)]: Number(updates.purchaseConversionFactor) }
+          : currentItem.unitConversions
+      );
+      const configuration = getItemUnitConfiguration({
+        ...currentItem.toObject(),
+        ...updates,
+        unit: baseUnit,
+        baseUnit,
+        unitConversions,
+        packagingOptions,
+        purchaseConversionFactor: updates.purchaseConversionFactor
+          ?? ((updates.purchaseUnit !== undefined || updates.packagingOptions !== undefined)
+            ? packageFactor
+            : currentItem.purchaseConversionFactor)
+      });
+      Object.assign(updates, configuration, { unit: configuration.baseUnit });
+    }
+    if (updates.purchaseUnit !== undefined
+      && normalizeInventoryUnit(updates.purchaseUnit) !== normalizeInventoryUnit(currentItem.purchaseUnit || currentItem.baseUnit || currentItem.unit)
+      && updates.purchasePrice === undefined) {
+      updates.purchasePrice = null;
+    }
+    if (updates.purchasePrice !== undefined
+      || (updates.purchaseConversionFactor !== undefined
+        && updates.purchaseUnit === undefined
+        && currentItem.purchasePrice !== null)) {
+      const factor = updates.purchaseConversionFactor
+        ?? currentItem.purchaseConversionFactor
+        ?? 1;
+      updates.unitCost = Number(updates.purchasePrice ?? currentItem.purchasePrice) / factor;
+    }
     const item = await InventoryItem.findOneAndUpdate(
       { _id: req.params.id, hotelId: req.hotelId, propertyId: req.propertyId },
       { $set: updates },
@@ -98,24 +306,40 @@ export const updateInventoryItem = async (req, res, next) => {
 export const createInventoryItem = async (req, res, next) => {
   try {
     const {
-      name, code, currentStock = 0, minStockThreshold = 0, unitCost = 0,
-      openingBatchNumber = '', openingExpiryDate = null, ...details
+      name, code, currentStock = 0, minStockThreshold = 0, unitCost = 0, purchasePrice,
+      openingUnit, openingBatchNumber = '', openingExpiryDate = null, baseUnitId, purchaseUnitId,
+      conversionFactor, additionalPackagingOptions = [], ...details
     } = req.body;
     const openingStock = Number(currentStock);
+    const unitConfiguration = await resolveItemUnits({
+      hotelId: req.hotelId,
+      baseUnitId,
+      purchaseUnitId,
+      conversionFactor: conversionFactor ?? details.purchaseConversionFactor,
+      additionalPackagingOptions
+    });
+    const baseUnitCost = purchasePrice !== undefined
+      ? Number(purchasePrice) / unitConfiguration.purchaseConversionFactor
+      : Number(unitCost);
     if (!name?.trim() || !code?.trim() || !Number.isFinite(openingStock) || openingStock < 0
       || !Number.isFinite(Number(minStockThreshold)) || Number(minStockThreshold) < 0
-      || !Number.isFinite(Number(unitCost)) || Number(unitCost) < 0) {
-      return res.status(400).json({ success: false, message: 'Name, item code, and valid non-negative stock, minimum level, and unit cost are required.' });
+      || !Number.isFinite(baseUnitCost) || baseUnitCost < 0
+      || (purchasePrice !== undefined && (!Number.isFinite(Number(purchasePrice)) || Number(purchasePrice) < 0))) {
+      return res.status(400).json({ success: false, message: 'Name, item code, and valid non-negative stock, minimum level, and purchase price are required.' });
     }
 
     const item = await runInventoryTransaction(async (session) => {
       const [created] = await InventoryItem.create([{
         ...details,
+        ...unitConfiguration,
         name: name.trim(),
         code: code.trim().toUpperCase(),
+        unit: unitConfiguration.baseUnit,
+        baseUnit: unitConfiguration.baseUnit,
+        purchasePrice: purchasePrice === undefined ? null : Number(purchasePrice),
         currentStock: 0,
         minStockThreshold: Number(minStockThreshold),
-        unitCost: Number(unitCost),
+        unitCost: baseUnitCost,
         hotelId: req.hotelId,
         propertyId: req.propertyId
       }], { session });
@@ -126,6 +350,7 @@ export const createInventoryItem = async (req, res, next) => {
           itemId: created._id,
           movementType: 'opening',
           quantity: openingStock,
+          unit: openingUnit || unitConfiguration.baseUnit,
           location: details.location || 'Main Store',
           batchNumber: openingBatchNumber,
           expiryDate: openingExpiryDate ? new Date(openingExpiryDate) : null,
@@ -180,6 +405,7 @@ export const recordStockMovement = async (req, res, next) => {
       itemId,
       movementType,
       quantity,
+      unit: req.body.unit,
       notes: notes || '',
       referenceNumber: referenceNumber || generateReference('MOV'),
       location: location || 'Main Store',
@@ -414,13 +640,35 @@ export const createPurchaseOrder = async (req, res, next) => {
       }
       const inventoryItem = await InventoryItem.findOne({
         _id: line.itemId, hotelId: req.hotelId, propertyId: req.propertyId, isActive: true
-      }).select('name unit');
+      }).select('name unit baseUnit baseUnitId purchaseUnit purchaseUnitId purchaseConversionFactor packagingOptions additionalPackagingOptions unitConversions');
       if (!inventoryItem) return res.status(400).json({ success: false, message: 'Purchase order contains an invalid inventory item.' });
+      const purchaseUnit = normalizeInventoryUnit(line.unit || inventoryItem.purchaseUnit || inventoryItem.baseUnit || inventoryItem.unit);
+      const conversionFactor = getUnitConversionFactor(inventoryItem, purchaseUnit);
+      const configuredUnitId = purchaseUnit === inventoryItem.baseUnit
+        ? inventoryItem.baseUnitId
+        : purchaseUnit === inventoryItem.purchaseUnit
+          ? inventoryItem.purchaseUnitId
+          : inventoryItem.packagingOptions.find((option) => option.unit === purchaseUnit)?.unitId
+            || inventoryItem.additionalPackagingOptions.find((option) => String(option.unitId) === String(line.unitId))?.unitId;
+      const requestedUnit = configuredUnitId
+        ? await Unit.findOne({ _id: configuredUnitId, hotelId: req.hotelId })
+        : await Unit.findOne({ hotelId: req.hotelId, symbolKey: purchaseUnit.toLocaleLowerCase(), isActive: true });
+      if (!requestedUnit) return res.status(400).json({ success: false, message: 'Purchase unit is not an active unit for this hotel.' });
+      if (!configuredUnitId && inventoryItem.baseUnitId) {
+        const baseUnitRecord = await Unit.findOne({ _id: inventoryItem.baseUnitId, hotelId: req.hotelId }).select('category');
+        if (!baseUnitRecord || requestedUnit.category !== baseUnitRecord.category) {
+          return res.status(400).json({ success: false, message: 'Purchase unit is not compatible with the item base unit.' });
+        }
+      }
       purchaseLines.push({
         itemId: inventoryItem._id,
         itemName: inventoryItem.name,
         quantity: Number(line.quantity),
-        unit: line.unit || inventoryItem.unit,
+        unit: purchaseUnit,
+        unitId: requestedUnit._id,
+        baseUnit: inventoryItem.baseUnit || inventoryItem.unit,
+        baseUnitId: inventoryItem.baseUnitId || null,
+        conversionFactor,
         unitCost: Number(line.unitCost),
         totalAmount: Number(line.quantity) * Number(line.unitCost)
       });
@@ -469,6 +717,10 @@ export const receivePurchaseOrder = async (req, res, next) => {
     if (!po) {
       return res.status(404).json({ success: false, message: 'Purchase order not found.' });
     }
+    const purchaseDate = req.body.purchaseDate ? new Date(req.body.purchaseDate) : new Date();
+    if (Number.isNaN(purchaseDate.getTime()) || purchaseDate > new Date()) {
+      return res.status(400).json({ success: false, message: 'Purchase date must be valid and cannot be in the future.' });
+    }
 
     const key = req.body.idempotencyKey || req.get('Idempotency-Key');
     const receipt = await runInventoryTransaction(async (session) => {
@@ -508,6 +760,11 @@ export const receivePurchaseOrder = async (req, res, next) => {
         poLine.receivedQuantity = (poLine.receivedQuantity || 0) + receivedQuantity;
         lines.push({
           itemId: poLine.itemId,
+          unit: poLine.unit || '',
+          unitId: poLine.unitId || null,
+          baseUnit: poLine.baseUnit || '',
+          baseUnitId: poLine.baseUnitId || null,
+          conversionFactor: poLine.conversionFactor || 1,
           receivedQuantity,
           acceptedQuantity,
           damagedQuantity,
@@ -523,6 +780,10 @@ export const receivePurchaseOrder = async (req, res, next) => {
             itemId: poLine.itemId,
             movementType: 'receipt',
             quantity: acceptedQuantity,
+            unit: poLine.unit,
+            unitId: poLine.unitId,
+            conversionFactor: poLine.conversionFactor || 1,
+            unitCost: poLine.unitCost / (poLine.conversionFactor || 1),
             location: req.body.location || 'Main Store',
             referenceNumber: currentPO.poNumber,
             notes: `Goods receipt for purchase order ${currentPO.poNumber}`,
@@ -530,6 +791,17 @@ export const receivePurchaseOrder = async (req, res, next) => {
             idempotencyKey: `grn:${key || currentPO._id + ':' + currentPO.items.indexOf(poLine)}:${lines.length}`,
             batchNumber,
             expiryDate,
+            transactionDate: purchaseDate,
+            receivedAt: purchaseDate,
+            batchDetails: {
+              purchaseQuantity: acceptedQuantity,
+              purchaseUnit: poLine.unit || '',
+              purchaseUnitCost: poLine.unitCost,
+              purchaseAmount: Math.round(acceptedQuantity * poLine.unitCost * 100) / 100,
+              vendorId: currentPO.vendorId,
+              purchaseOrderId: currentPO._id,
+              invoiceNumber: String(req.body.invoiceNumber || '').trim()
+            },
             session
           });
         }
@@ -546,6 +818,7 @@ export const receivePurchaseOrder = async (req, res, next) => {
         location: req.body.location || 'Main Store',
         lines,
         receivedBy: req.user._id,
+        receivedAt: purchaseDate,
         notes: req.body.notes || ''
       }], { session });
       const receivedSubtotal = lines.reduce(
