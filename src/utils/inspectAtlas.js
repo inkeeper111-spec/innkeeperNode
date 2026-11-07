@@ -1,9 +1,8 @@
-import dns from 'dns';
+import 'dotenv/config';
 import mongoose from 'mongoose';
 
-dns.setServers(['192.168.0.1', '8.8.8.8', '1.1.1.1']);
-
-const uri = 'mongodb+srv://ranjithraja325:Thottam123@cluster0.2bgzz.mongodb.net/hotel';
+const uri = process.env.MONGODB_URI;
+if (!uri) throw new Error('MONGODB_URI is required to run this utility.');
 
 const run = async () => {
   await mongoose.connect(uri, { serverSelectionTimeoutMS: 20000, connectTimeoutMS: 20000 });

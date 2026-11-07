@@ -4,7 +4,7 @@ import { connectDB } from './config/db.js';
 import { ensureDemoUsers } from './utils/ensureDemoUsers.js';
 import { logger } from './config/logger.js';
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5010;
 
 const startServer = async () => {
   try {

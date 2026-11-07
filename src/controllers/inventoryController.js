@@ -1,5 +1,6 @@
+import mongoose from 'mongoose';
 import {
-  DepartmentRequest, GoodsReceipt, InventoryBatch, InventoryItem, InventoryRecipe, Unit,
+  DepartmentRequest, GoodsReceipt, InventoryBatch, InventoryItem, InventoryRecipe, StockReceiptRequest, Unit,
   MinibarStock, MinibarTransaction, StockMovement, SupplierPayment, Vendor, PurchaseOrder
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
@@ -12,6 +13,15 @@ import {
 
 const isAdministrator = (user) => ['hotel_admin', 'super_admin'].includes(user?.role);
 const unitConfigurationError = (message) => Object.assign(new Error(message), { statusCode: 400 });
+const getConfiguredRawMaterialUnit = (item, unitSymbol) => (item.supportedUnits || []).find((entry) => (
+  entry.isActive !== false
+  && normalizeInventoryUnit(entry.unitSymbolSnapshot || entry.unitId?.symbol || '')
+    === normalizeInventoryUnit(unitSymbol || '')
+  && Number(entry.conversionFactorToBase) > 0
+));
+const quantityInBaseUnit = (quantity, conversionFactor) => (
+  Math.round((Number(quantity) * Number(conversionFactor) + Number.EPSILON) * 100000000) / 100000000
+);
 
 const resolveItemUnits = async ({
   hotelId,
@@ -160,8 +170,11 @@ export const getInventoryItems = async (req, res, next) => {
       .populate('vendorId', 'name contactPerson phone')
       .populate('baseUnitId', 'name symbol category isActive')
       .populate('purchaseUnitId', 'name symbol category isActive')
+      .populate('preferredPurchaseUnitId', 'name symbol category isActive')
       .populate('additionalPackagingOptions.unitId', 'name symbol category isActive')
       .populate('packagingOptions.unitId', 'name symbol category isActive')
+      .populate('supportedUnits.unitId', 'name symbol category isActive')
+      .populate('supportedUnits.packageMeasurementUnitId', 'name symbol category isActive')
       .sort({ [sortField]: sortDirection })
       .skip((pageNumber - 1) * pageSize)
       .limit(pageSize)
@@ -181,6 +194,436 @@ export const getInventoryItems = async (req, res, next) => {
     res.json({ success: true, data: rows, pagination: { page: pageNumber, limit: pageSize, total, pages: Math.ceil(total / pageSize) } });
   } catch (err) {
     next(err);
+  }
+};
+
+export const getInventoryBatches = async (req, res, next) => {
+  try {
+    const { itemId } = req.query;
+    if (!itemId || !mongoose.isValidObjectId(itemId)) {
+      return res.status(400).json({ success: false, message: 'Choose a valid inventory item to view its batches.' });
+    }
+    const item = await InventoryItem.findOne({
+      _id: itemId,
+      hotelId: req.hotelId,
+      propertyId: req.propertyId
+    }).select('_id');
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    }
+    const batches = await InventoryBatch.find({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      ...(req.query.location ? { location: String(req.query.location).trim() } : {})
+    })
+      .populate('vendorId', 'name')
+      .sort({ receivedAt: 1, _id: 1 })
+      .lean();
+    res.json({
+      success: true,
+      data: batches.map((batch) => ({
+        ...batch,
+        status: batch.remainingQuantity > 0 ? 'open' : 'closed'
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getStockReceiptRequests = async (req, res, next) => {
+  try {
+    const filter = { hotelId: req.hotelId, propertyId: req.propertyId };
+    if (req.query.status) filter.status = req.query.status;
+    const requests = await StockReceiptRequest.find(filter)
+      .populate('itemId', 'name code unit baseUnit')
+      .populate('vendorId', 'name')
+      .populate('requestedBy reviewedBy', 'name')
+      .sort({ createdAt: -1 })
+      .limit(Math.min(200, Number(req.query.limit) || 100))
+      .lean();
+    res.json({ success: true, data: requests });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createStockReceiptRequest = async (req, res, next) => {
+  try {
+    const {
+      itemId, quantity, unit, purchaseUnitPrice,
+      existingStockDeduction = 0, existingStockDeductionQuantity,
+      existingStockDeductionUnit = '', wastageQuantity = 0, wastageUnit = '', wastageReason = ''
+    } = req.body;
+    const requestedQuantity = Number(quantity);
+    const unitPrice = Number(purchaseUnitPrice);
+    const enteredStockDeduction = existingStockDeductionQuantity === undefined
+      ? Number(existingStockDeduction)
+      : Number(existingStockDeductionQuantity);
+    const enteredWastageQuantity = Number(wastageQuantity);
+    const location = String(req.body.location || 'Main Store').trim();
+    if (!mongoose.isValidObjectId(itemId) || !unit?.trim() || !location
+      || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0
+      || !Number.isFinite(unitPrice) || unitPrice < 0
+      || !Number.isFinite(enteredStockDeduction) || enteredStockDeduction < 0
+      || !Number.isFinite(enteredWastageQuantity) || enteredWastageQuantity < 0) {
+      return res.status(400).json({ success: false, message: 'Enter a valid raw material, purchase unit, location, positive quantity, and non-negative purchase price.' });
+    }
+
+    const item = await InventoryItem.findOne({
+      _id: itemId,
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      inventoryType: 'raw_material',
+      isActive: true
+    }).populate('supportedUnits.unitId', 'symbol name').lean();
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Active raw material not found.' });
+    }
+    const selectedUnit = getConfiguredRawMaterialUnit(item, unit);
+    if (!selectedUnit) {
+      return res.status(400).json({ success: false, message: 'Choose a configured purchase unit for this raw material.' });
+    }
+    const deductionUnit = existingStockDeductionQuantity === undefined
+      ? null
+      : getConfiguredRawMaterialUnit(item, existingStockDeductionUnit);
+    if (existingStockDeductionQuantity !== undefined && enteredStockDeduction > 0 && !deductionUnit) {
+      return res.status(400).json({ success: false, message: 'Choose a configured unit for the existing-stock deduction.' });
+    }
+    const stockDeduction = existingStockDeductionQuantity === undefined
+      ? enteredStockDeduction
+      : quantityInBaseUnit(enteredStockDeduction, deductionUnit?.conversionFactorToBase || 1);
+    let wastageBaseQuantity = 0;
+    let wastageUnitEntry = null;
+    const normalizedWastageReason = String(wastageReason || '').trim();
+    if (enteredWastageQuantity > 0) {
+      wastageUnitEntry = getConfiguredRawMaterialUnit(item, wastageUnit);
+      if (!wastageUnitEntry || !normalizedWastageReason) {
+        return res.status(400).json({ success: false, message: 'Choose a configured wastage unit and enter a reason.' });
+      }
+      wastageBaseQuantity = quantityInBaseUnit(
+        enteredWastageQuantity,
+        wastageUnitEntry.conversionFactorToBase
+      );
+      if (!Number.isFinite(wastageBaseQuantity) || wastageBaseQuantity <= 0) {
+        return res.status(400).json({ success: false, message: 'Enter a valid positive wastage quantity.' });
+      }
+    }
+    const vendorId = req.body.vendorId || null;
+    if (vendorId) {
+      const vendor = await Vendor.findOne({
+        _id: vendorId, hotelId: req.hotelId, status: 'active'
+      }).select('_id');
+      if (!vendor) {
+        return res.status(400).json({ success: false, message: 'Choose an active vendor belonging to this hotel.' });
+      }
+    }
+    const expiryDate = req.body.expiryDate ? new Date(req.body.expiryDate) : null;
+    if ((expiryDate && Number.isNaN(expiryDate.getTime())) || (item.trackExpiry && !expiryDate)) {
+      return res.status(400).json({ success: false, message: `A valid expiry date is required${item.trackExpiry ? ' for this raw material' : ''}.` });
+    }
+
+    const previousBatches = await InventoryBatch.find({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      location,
+      remainingQuantity: { $gt: 0 }
+    }).sort({ receivedAt: 1, _id: 1 }).lean();
+    const previousAvailableQuantity = previousBatches.reduce(
+      (total, batch) => total + batch.remainingQuantity, 0
+    );
+    if (previousAvailableQuantity <= 0) {
+      return res.status(409).json({ success: false, message: 'There is no remaining stock in an earlier batch. Refresh the batch history and submit a regular stock receipt.' });
+    }
+    if (stockDeduction > previousAvailableQuantity) {
+      return res.status(400).json({ success: false, message: `The quantity to deduct cannot exceed the ${previousAvailableQuantity} ${item.baseUnit || item.unit} already available.` });
+    }
+    const requestedReceiptBaseQuantity = quantityInBaseUnit(
+      requestedQuantity,
+      selectedUnit.conversionFactorToBase
+    );
+    const wastageEligibleQuantity = requestedReceiptBaseQuantity
+      + (stockDeduction > 0 ? previousAvailableQuantity - stockDeduction : 0);
+    if (wastageBaseQuantity > wastageEligibleQuantity) {
+      return res.status(400).json({
+        success: false,
+        message: `Wastage cannot exceed the ${item.baseUnit || item.unit} stock eligible after the existing-stock deduction and fresh receipt.`
+      });
+    }
+
+    const request = await StockReceiptRequest.create({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      quantity: requestedQuantity,
+      unit: normalizeInventoryUnit(unit),
+      purchaseUnitPrice: unitPrice,
+      vendorId,
+      department: String(req.body.department || '').trim(),
+      location,
+      expiryDate,
+      notes: String(req.body.notes || '').trim(),
+      previousBatches: previousBatches.map((batch) => ({
+        batchId: batch._id,
+        batchNumber: batch.batchNumber,
+        remainingQuantity: batch.remainingQuantity
+      })),
+      previousAvailableQuantity,
+      existingStockDeduction: stockDeduction,
+      existingStockDeductionEnteredQuantity: existingStockDeductionQuantity === undefined
+        ? null
+        : enteredStockDeduction,
+      existingStockDeductionUnit: existingStockDeductionQuantity === undefined
+        ? ''
+        : normalizeInventoryUnit(existingStockDeductionUnit || item.baseUnit || item.unit),
+      remainingPreviousStockAfterDeduction: previousAvailableQuantity - stockDeduction,
+      wastageQuantity: wastageBaseQuantity,
+      wastageEnteredQuantity: enteredWastageQuantity || null,
+      wastageUnit: enteredWastageQuantity > 0 ? normalizeInventoryUnit(wastageUnit) : '',
+      wastageReason: enteredWastageQuantity > 0 ? normalizedWastageReason : '',
+      requestedBy: req.user._id
+    });
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'CREATE_STOCK_RECEIPT_REQUEST',
+      entity: 'StockReceiptRequest',
+      entityId: request._id,
+      details: {
+        itemId: String(item._id),
+        previousAvailableQuantity,
+        existingStockDeduction: stockDeduction,
+        existingStockDeductionEnteredQuantity: existingStockDeductionQuantity === undefined
+          ? null
+          : enteredStockDeduction,
+        existingStockDeductionUnit: existingStockDeductionQuantity === undefined
+          ? ''
+          : normalizeInventoryUnit(existingStockDeductionUnit || item.baseUnit || item.unit),
+        remainingPreviousStockAfterDeduction: previousAvailableQuantity - stockDeduction,
+        wastageQuantity: wastageBaseQuantity,
+        wastageEnteredQuantity: enteredWastageQuantity || 0,
+        wastageUnit: enteredWastageQuantity > 0 ? normalizeInventoryUnit(wastageUnit) : '',
+        wastageReason: enteredWastageQuantity > 0 ? normalizedWastageReason : '',
+        location
+      },
+      req
+    });
+    res.status(201).json({ success: true, data: request });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const reviewStockReceiptRequest = async (req, res, next) => {
+  try {
+    if (!isAdministrator(req.user)) {
+      return res.status(403).json({ success: false, message: 'Hotel administrator approval is required.' });
+    }
+    const { decision, reviewNotes = '' } = req.body;
+    if (!['approve', 'reject'].includes(decision)) {
+      return res.status(400).json({ success: false, message: 'Decision must be approve or reject.' });
+    }
+    const result = await runInventoryTransaction(async (session) => {
+      const receiptRequest = await StockReceiptRequest.findOne({
+        _id: req.params.id,
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        status: 'pending'
+      }).session(session);
+      if (!receiptRequest) {
+        throw Object.assign(new Error('Pending stock receipt approval not found.'), { statusCode: 404 });
+      }
+      receiptRequest.status = decision === 'approve' ? 'approved' : 'rejected';
+      receiptRequest.reviewedBy = req.user._id;
+      receiptRequest.reviewedAt = new Date();
+      receiptRequest.reviewNotes = String(reviewNotes).trim();
+      if (decision === 'approve') {
+        const previousBatchIds = receiptRequest.previousBatches.map((batch) => batch.batchId);
+        if (receiptRequest.existingStockDeduction > 0) {
+          const eligibleBatches = await InventoryBatch.find({
+            _id: { $in: previousBatchIds },
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId: receiptRequest.itemId,
+            location: receiptRequest.location,
+            remainingQuantity: { $gt: 0 }
+          }).session(session);
+          const eligibleQuantity = eligibleBatches.reduce(
+            (total, batch) => total + batch.remainingQuantity, 0
+          );
+          if (eligibleQuantity < receiptRequest.existingStockDeduction) {
+            throw Object.assign(new Error(
+              `Only ${eligibleQuantity} units remain in the previously recorded batches; refresh the stock count before approving this restock.`
+            ), { statusCode: 409 });
+          }
+          const item = await InventoryItem.findOne({
+            _id: receiptRequest.itemId,
+            hotelId: req.hotelId,
+            propertyId: req.propertyId
+          }).select('baseUnit unit').session(session);
+          if (!item) {
+            throw Object.assign(new Error('Raw material not found while approving restock.'), { statusCode: 404 });
+          }
+          const deductionResult = await postStockMovement({
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId: receiptRequest.itemId,
+            movementType: 'issue',
+            quantity: receiptRequest.existingStockDeduction,
+            unit: item.baseUnit || item.unit,
+            batchIds: previousBatchIds,
+            location: receiptRequest.location,
+            department: receiptRequest.department,
+            notes: `Existing stock deduction approved for restock request ${receiptRequest._id}.`,
+            referenceNumber: `RESTOCK-USE-${receiptRequest._id}`,
+            recordedBy: req.user._id,
+            idempotencyKey: `stock-receipt-request-deduction:${receiptRequest._id}`,
+            session
+          });
+          receiptRequest.deductionMovementId = deductionResult.movement._id;
+        }
+        const remainingPreviousBatches = await InventoryBatch.find({
+          _id: { $in: previousBatchIds },
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          itemId: receiptRequest.itemId,
+          location: receiptRequest.location
+        }).session(session);
+        receiptRequest.remainingPreviousStockAfterDeduction = remainingPreviousBatches.reduce(
+          (total, batch) => total + batch.remainingQuantity, 0
+        );
+        const movementResult = await postStockMovement({
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          itemId: receiptRequest.itemId,
+          movementType: 'receipt',
+          quantity: receiptRequest.quantity,
+          unit: receiptRequest.unit,
+          purchaseUnitPrice: receiptRequest.purchaseUnitPrice,
+          vendorId: receiptRequest.vendorId,
+          autoGenerateBatchNumber: true,
+          location: receiptRequest.location,
+          department: receiptRequest.department,
+          notes: receiptRequest.notes,
+          referenceNumber: `RESTOCK-${receiptRequest._id}`,
+          expiryDate: receiptRequest.expiryDate,
+          batchDetails: {
+            purchaseQuantity: receiptRequest.quantity,
+            purchaseUnit: receiptRequest.unit,
+            purchaseUnitCost: receiptRequest.purchaseUnitPrice,
+            purchaseAmount: receiptRequest.quantity * receiptRequest.purchaseUnitPrice
+          },
+          recordedBy: req.user._id,
+          idempotencyKey: `stock-receipt-request:${receiptRequest._id}`,
+          session
+        });
+        receiptRequest.movementId = movementResult.movement._id;
+        receiptRequest.batchNumber = movementResult.movement.batchNumber || '';
+        if (receiptRequest.wastageQuantity > 0) {
+          const wastageItem = await InventoryItem.findOne({
+            _id: receiptRequest.itemId,
+            hotelId: req.hotelId,
+            propertyId: req.propertyId
+          }).select('baseUnit unit').session(session);
+          if (!wastageItem) {
+            throw Object.assign(new Error('Raw material not found while recording receipt wastage.'), { statusCode: 404 });
+          }
+          const freshBatch = await InventoryBatch.findOne({
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId: receiptRequest.itemId,
+            location: receiptRequest.location,
+            batchNumber: movementResult.movement.batchNumber
+          }).sort({ receivedAt: -1, _id: -1 }).session(session);
+          if (!freshBatch) {
+            throw Object.assign(new Error('Fresh receipt batch not found while recording its wastage.'), { statusCode: 409 });
+          }
+          const wastageBatchIds = receiptRequest.existingStockDeduction > 0
+            ? [...previousBatchIds, freshBatch._id]
+            : [freshBatch._id];
+          const availableForWastage = await InventoryBatch.find({
+            _id: { $in: wastageBatchIds },
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId: receiptRequest.itemId,
+            location: receiptRequest.location,
+            remainingQuantity: { $gt: 0 },
+            $or: [{ expiryDate: null }, { expiryDate: { $gt: new Date() } }]
+          }).session(session);
+          const usableWastageQuantity = availableForWastage.reduce(
+            (total, batch) => total + batch.remainingQuantity, 0
+          );
+          if (usableWastageQuantity < receiptRequest.wastageQuantity) {
+            throw Object.assign(new Error(
+              `Only ${usableWastageQuantity} ${wastageItem.baseUnit || wastageItem.unit} remain in eligible batches for this wastage.`
+            ), { statusCode: 409 });
+          }
+          let quantityToReference = receiptRequest.wastageQuantity;
+          const affectedBatches = [];
+          for (const batch of availableForWastage.sort((left, right) => (
+            new Date(left.receivedAt) - new Date(right.receivedAt)
+            || String(left._id).localeCompare(String(right._id))
+          ))) {
+            if (quantityToReference <= 0) break;
+            const allocatedQuantity = Math.min(batch.remainingQuantity, quantityToReference);
+            if (allocatedQuantity > 0) {
+              affectedBatches.push(batch);
+              quantityToReference = Math.max(0, quantityToReference - allocatedQuantity);
+            }
+          }
+          const affectedBatchNumbers = affectedBatches.map((batch) => batch.batchNumber || String(batch._id));
+          const wastageResult = await postStockMovement({
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId: receiptRequest.itemId,
+            movementType: 'wastage',
+            quantity: receiptRequest.wastageQuantity,
+            unit: wastageItem.baseUnit || wastageItem.unit,
+            batchIds: wastageBatchIds,
+            batchNumber: affectedBatchNumbers[0] || '',
+            location: receiptRequest.location,
+            department: receiptRequest.department,
+            notes: `Wastage during stock receipt: ${receiptRequest.wastageReason}. Affected batches: ${affectedBatchNumbers.join(', ')}.`,
+            referenceNumber: `RESTOCK-WASTE-${receiptRequest._id}`,
+            recordedBy: req.user._id,
+            idempotencyKey: `stock-receipt-request-wastage:${receiptRequest._id}`,
+            metadata: {
+              reason: receiptRequest.wastageReason,
+              source: 'raw_material_receipt',
+              stockReceiptRequestId: String(receiptRequest._id),
+              batchNumbers: affectedBatchNumbers
+            },
+            session
+          });
+          receiptRequest.wastageMovementId = wastageResult.movement._id;
+        }
+      }
+      await receiptRequest.save({ session });
+      return receiptRequest;
+    });
+    await logAudit({
+      hotelId: req.hotelId,
+      action: `STOCK_RECEIPT_REQUEST_${decision.toUpperCase()}`,
+      entity: 'StockReceiptRequest',
+      entityId: result._id,
+      details: {
+        itemId: String(result.itemId),
+        quantity: result.quantity,
+        previousAvailableQuantity: result.previousAvailableQuantity,
+        existingStockDeduction: result.existingStockDeduction,
+        remainingPreviousStockAfterDeduction: result.remainingPreviousStockAfterDeduction,
+        wastageQuantity: result.wastageQuantity,
+        wastageUnit: result.wastageUnit,
+        wastageReason: result.wastageReason,
+        wastageMovementId: result.wastageMovementId,
+        batchNumber: result.batchNumber
+      },
+      req
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -305,6 +748,12 @@ export const updateInventoryItem = async (req, res, next) => {
 
 export const createInventoryItem = async (req, res, next) => {
   try {
+    if (req.body.inventoryType === 'raw_material') {
+      return res.status(400).json({
+        success: false,
+        message: 'Create raw materials through the Raw Material Master so categories and unit conversions are validated.'
+      });
+    }
     const {
       name, code, currentStock = 0, minStockThreshold = 0, unitCost = 0, purchasePrice,
       openingUnit, openingBatchNumber = '', openingExpiryDate = null, baseUnitId, purchaseUnitId,
@@ -385,9 +834,104 @@ export const createInventoryItem = async (req, res, next) => {
  */
 export const recordStockMovement = async (req, res, next) => {
   try {
-    const { itemId, movementType, quantity, notes, referenceNumber, location, department, idempotencyKey } = req.body;
+    const {
+      itemId, movementType, quantity, notes, referenceNumber, location, department, idempotencyKey
+    } = req.body;
+    const receiptLocation = String(location || 'Main Store').trim() || 'Main Store';
+    const autoGenerateBatchNumber = req.body.autoGenerateBatchNumber === true;
+    const hasWastageQuantity = req.body.wastageQuantity !== undefined;
+    const wastageQuantity = hasWastageQuantity ? Number(req.body.wastageQuantity) : 0;
+    if (hasWastageQuantity && (!Number.isFinite(wastageQuantity) || wastageQuantity < 0)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid non-negative wastage quantity.' });
+    }
+    if (wastageQuantity > 0
+      && (movementType !== 'receipt' || !autoGenerateBatchNumber
+        || !String(req.body.wastageUnit || '').trim() || !String(req.body.wastageReason || '').trim())) {
+      return res.status(400).json({ success: false, message: 'Wastage requires a raw-material receipt, configured wastage unit, and reason.' });
+    }
     if (!['receipt', 'issue', 'adjustment', 'wastage', 'return'].includes(movementType)) {
       return res.status(400).json({ success: false, message: 'Unsupported stock movement type.' });
+    }
+    if (autoGenerateBatchNumber && movementType !== 'receipt') {
+      return res.status(400).json({ success: false, message: 'Automatic batch numbers are only available for stock receipts.' });
+    }
+    let receiptMaterial = null;
+    let wastageUnitEntry = null;
+    let wastageReason = '';
+    let wastageBaseQuantity = 0;
+    if (autoGenerateBatchNumber) {
+      receiptMaterial = await InventoryItem.findOne({
+        _id: itemId,
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        inventoryType: 'raw_material',
+        isActive: true
+      }).select('_id baseUnit unit supportedUnits').lean();
+      if (!receiptMaterial) {
+        return res.status(400).json({ success: false, message: 'Choose an active raw material for this stock receipt.' });
+      }
+      if (!Number.isFinite(Number(req.body.purchaseUnitPrice)) || Number(req.body.purchaseUnitPrice) < 0) {
+        return res.status(400).json({ success: false, message: 'Enter a valid purchase price for the selected purchase unit.' });
+      }
+      if (wastageQuantity > 0) {
+        const selectedReceiptUnit = getConfiguredRawMaterialUnit(receiptMaterial, req.body.unit);
+        wastageUnitEntry = getConfiguredRawMaterialUnit(receiptMaterial, req.body.wastageUnit);
+        wastageReason = String(req.body.wastageReason).trim();
+        if (!selectedReceiptUnit || !wastageUnitEntry) {
+          return res.status(400).json({ success: false, message: 'Choose configured purchase and wastage units for this raw material.' });
+        }
+        wastageBaseQuantity = quantityInBaseUnit(
+          wastageQuantity,
+          wastageUnitEntry.conversionFactorToBase
+        );
+        const receiptBaseQuantity = quantityInBaseUnit(
+          Number(quantity),
+          selectedReceiptUnit.conversionFactorToBase
+        );
+        if (!Number.isFinite(wastageBaseQuantity) || wastageBaseQuantity <= 0
+          || !Number.isFinite(receiptBaseQuantity) || receiptBaseQuantity <= 0
+          || wastageBaseQuantity > receiptBaseQuantity) {
+          return res.status(400).json({
+            success: false,
+            message: `Wastage cannot exceed the fresh receipt quantity in ${receiptMaterial.baseUnit || receiptMaterial.unit}.`
+          });
+        }
+      }
+    }
+    if (movementType === 'receipt' && autoGenerateBatchNumber && mongoose.isValidObjectId(itemId)) {
+      const rawMaterial = await InventoryItem.findOne({
+        _id: itemId,
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        inventoryType: 'raw_material'
+      }).select('_id');
+      if (rawMaterial) {
+        const previousBatchAvailable = await InventoryBatch.exists({
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          itemId: rawMaterial._id,
+          location: receiptLocation,
+          remainingQuantity: { $gt: 0 }
+        });
+        if (previousBatchAvailable) {
+          return res.status(409).json({
+            success: false,
+            message: 'This raw material still has stock in an earlier batch. Submit the receipt for approval before adding another batch.'
+          });
+        }
+      }
+    }
+    let vendorId = null;
+    if (req.body.vendorId) {
+      const vendor = await Vendor.findOne({
+        _id: req.body.vendorId,
+        hotelId: req.hotelId,
+        status: 'active'
+      }).select('_id');
+      if (!vendor) {
+        return res.status(400).json({ success: false, message: 'Choose an active vendor belonging to this hotel.' });
+      }
+      vendorId = vendor._id;
     }
     if (movementType === 'adjustment' && !isAdministrator(req.user)) {
       return res.status(403).json({ success: false, message: 'Only hotel administrators can post direct stock adjustments.' });
@@ -399,27 +943,99 @@ export const recordStockMovement = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Department is required for stock issues.' });
     }
 
-    const result = await runInventoryTransaction((session) => postStockMovement({
-      hotelId: req.hotelId,
-      propertyId: req.propertyId,
-      itemId,
-      movementType,
-      quantity,
-      unit: req.body.unit,
-      notes: notes || '',
-      referenceNumber: referenceNumber || generateReference('MOV'),
-      location: location || 'Main Store',
-      department: department || '',
-      batchNumber: req.body.batchNumber || '',
-      expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
-      recordedBy: req.user._id,
-      idempotencyKey: idempotencyKey || req.get('Idempotency-Key'),
-      session
-    }));
+    const movementIdempotencyKey = idempotencyKey || req.get('Idempotency-Key');
+    const result = await runInventoryTransaction(async (session) => {
+      const receiptResult = await postStockMovement({
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        itemId,
+        movementType,
+        quantity,
+        unit: req.body.unit,
+        unitCost: req.body.unitCost,
+        purchaseUnitPrice: req.body.purchaseUnitPrice,
+        vendorId,
+        autoGenerateBatchNumber,
+        purchasePackageId: req.body.purchasePackageId || null,
+        packageQuantity: req.body.packageQuantity,
+        looseQuantity: req.body.looseQuantity,
+        notes: notes || '',
+        referenceNumber: referenceNumber || generateReference('MOV'),
+        location: movementType === 'receipt' ? receiptLocation : location || 'Main Store',
+        department: department || '',
+        batchNumber: req.body.batchNumber || '',
+        expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
+        batchDetails: req.body.purchaseUnitPrice !== undefined ? {
+          purchaseQuantity: Number(quantity),
+          purchaseUnit: req.body.unit || '',
+          purchaseUnitCost: Number(req.body.purchaseUnitPrice),
+          purchaseAmount: Number(quantity) * Number(req.body.purchaseUnitPrice)
+        } : {},
+        recordedBy: req.user._id,
+        idempotencyKey: movementIdempotencyKey,
+        session
+      });
+      if (receiptResult.duplicate || wastageBaseQuantity <= 0) return receiptResult;
+
+      const freshBatch = await InventoryBatch.findOne({
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        itemId,
+        location: receiptLocation,
+        batchNumber: receiptResult.movement.batchNumber
+      }).sort({ receivedAt: -1, _id: -1 }).session(session);
+      if (!freshBatch || freshBatch.remainingQuantity < wastageBaseQuantity) {
+        throw Object.assign(new Error('Fresh receipt batch does not contain enough stock for the entered wastage.'), { statusCode: 409 });
+      }
+      const wastageResult = await postStockMovement({
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        itemId,
+        movementType: 'wastage',
+        quantity: wastageBaseQuantity,
+        unit: receiptMaterial.baseUnit || receiptMaterial.unit,
+        batchIds: [freshBatch._id],
+        batchNumber: freshBatch.batchNumber || '',
+        location: receiptLocation,
+        department: department || '',
+        notes: `Wastage during stock receipt: ${wastageReason}. Affected batch: ${freshBatch.batchNumber || freshBatch._id}.`,
+        referenceNumber: `${receiptResult.movement.referenceNumber}-WASTE`,
+        recordedBy: req.user._id,
+        idempotencyKey: movementIdempotencyKey ? `${movementIdempotencyKey}:wastage` : undefined,
+        metadata: {
+          reason: wastageReason,
+          source: 'raw_material_receipt',
+          receiptMovementId: String(receiptResult.movement._id),
+          batchNumbers: [freshBatch.batchNumber || String(freshBatch._id)]
+        },
+        session
+      });
+      return { ...wastageResult, movement: receiptResult.movement, wastageMovement: wastageResult.movement };
+    });
     if (result.duplicate) {
       return res.json({ success: true, message: 'Stock movement was already recorded.', data: { movement: result.movement } });
     }
     const { movement, item } = result;
+    if (result.wastageMovement) {
+      await logAudit({
+        hotelId: req.hotelId,
+        action: 'RECORD_RAW_MATERIAL_WASTAGE',
+        entity: 'StockMovement',
+        entityId: result.wastageMovement._id,
+        details: {
+          itemId: String(itemId),
+          receiptMovementId: String(movement._id),
+          wastageMovementId: String(result.wastageMovement._id),
+          quantity: result.wastageMovement.quantity,
+          unit: receiptMaterial.baseUnit || receiptMaterial.unit,
+          enteredQuantity: wastageQuantity,
+          enteredUnit: normalizeInventoryUnit(req.body.wastageUnit),
+          reason: wastageReason,
+          batchAllocations: result.wastageMovement.batchAllocations
+        },
+        req
+      });
+    }
 
     // Check low stock trigger
     if (item.currentStock <= item.minStockThreshold) {
@@ -440,7 +1056,7 @@ export const recordStockMovement = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: 'Stock movement recorded successfully.',
-      data: { movement, item }
+      data: { movement, item, wastageMovement: result.wastageMovement || null }
     });
   } catch (err) {
     next(err);
@@ -640,18 +1256,58 @@ export const createPurchaseOrder = async (req, res, next) => {
       }
       const inventoryItem = await InventoryItem.findOne({
         _id: line.itemId, hotelId: req.hotelId, propertyId: req.propertyId, isActive: true
-      }).select('name unit baseUnit baseUnitId purchaseUnit purchaseUnitId purchaseConversionFactor packagingOptions additionalPackagingOptions unitConversions');
+      }).select('name unit baseUnit baseUnitId purchaseUnit purchaseUnitId preferredPurchaseUnitId purchaseConversionFactor packagingOptions additionalPackagingOptions unitConversions inventoryType supportedUnits');
       if (!inventoryItem) return res.status(400).json({ success: false, message: 'Purchase order contains an invalid inventory item.' });
-      const purchaseUnit = normalizeInventoryUnit(line.unit || inventoryItem.purchaseUnit || inventoryItem.baseUnit || inventoryItem.unit);
-      const conversionFactor = getUnitConversionFactor(inventoryItem, purchaseUnit);
-      const configuredUnitId = purchaseUnit === inventoryItem.baseUnit
+      let configuredPurchaseUnit = null;
+      if (inventoryItem.inventoryType === 'raw_material') {
+        const activePurchaseUnits = inventoryItem.supportedUnits.filter((supportedUnit) => supportedUnit.isActive);
+        configuredPurchaseUnit = line.purchasePackageId
+          ? activePurchaseUnits.find((supportedUnit) => String(supportedUnit._id) === String(line.purchasePackageId))
+          : line.unitId
+            ? activePurchaseUnits.find((supportedUnit) => String(supportedUnit.unitId) === String(line.unitId)
+              && supportedUnit.isDefaultPurchaseUnit)
+              || activePurchaseUnits.find((supportedUnit) => String(supportedUnit.unitId) === String(line.unitId))
+            : line.unit
+              ? activePurchaseUnits.find((supportedUnit) => (
+                normalizeInventoryUnit(supportedUnit.unitSymbolSnapshot)
+                === normalizeInventoryUnit(line.unit)
+              ) && supportedUnit.isDefaultPurchaseUnit)
+                || activePurchaseUnits.find((supportedUnit) => (
+                  normalizeInventoryUnit(supportedUnit.unitSymbolSnapshot)
+                  === normalizeInventoryUnit(line.unit)
+                ))
+              : activePurchaseUnits.find((supportedUnit) => supportedUnit.isDefaultPurchaseUnit)
+                || activePurchaseUnits.find((supportedUnit) => String(supportedUnit.unitId) === String(inventoryItem.preferredPurchaseUnitId));
+        if (!configuredPurchaseUnit) {
+          return res.status(400).json({
+            success: false,
+            message: `Choose an active purchase unit configured for ${inventoryItem.name}.`
+          });
+        }
+      }
+      const purchaseUnit = normalizeInventoryUnit(
+        configuredPurchaseUnit?.unitSymbolSnapshot
+          || line.unit
+          || inventoryItem.purchaseUnit
+          || inventoryItem.baseUnit
+          || inventoryItem.unit
+      );
+      const conversionFactor = configuredPurchaseUnit
+        ? Number(configuredPurchaseUnit.conversionFactorToBase)
+        : getUnitConversionFactor(inventoryItem, purchaseUnit);
+      const configuredUnitId = configuredPurchaseUnit?.unitId
+        || (purchaseUnit === inventoryItem.baseUnit
         ? inventoryItem.baseUnitId
         : purchaseUnit === inventoryItem.purchaseUnit
           ? inventoryItem.purchaseUnitId
           : inventoryItem.packagingOptions.find((option) => option.unit === purchaseUnit)?.unitId
-            || inventoryItem.additionalPackagingOptions.find((option) => String(option.unitId) === String(line.unitId))?.unitId;
+            || inventoryItem.additionalPackagingOptions.find((option) => String(option.unitId) === String(line.unitId))?.unitId);
       const requestedUnit = configuredUnitId
-        ? await Unit.findOne({ _id: configuredUnitId, hotelId: req.hotelId })
+        ? await Unit.findOne({
+          _id: configuredUnitId,
+          hotelId: req.hotelId,
+          ...(configuredPurchaseUnit ? { isActive: true } : {})
+        })
         : await Unit.findOne({ hotelId: req.hotelId, symbolKey: purchaseUnit.toLocaleLowerCase(), isActive: true });
       if (!requestedUnit) return res.status(400).json({ success: false, message: 'Purchase unit is not an active unit for this hotel.' });
       if (!configuredUnitId && inventoryItem.baseUnitId) {
@@ -660,14 +1316,27 @@ export const createPurchaseOrder = async (req, res, next) => {
           return res.status(400).json({ success: false, message: 'Purchase unit is not compatible with the item base unit.' });
         }
       }
+      const baseUnitRecord = inventoryItem.baseUnitId
+        ? await Unit.findOne({ _id: inventoryItem.baseUnitId, hotelId: req.hotelId }).select('name symbol')
+        : null;
+      const packageConfigured = Number(configuredPurchaseUnit?.packageSize) > 0
+        && Boolean(configuredPurchaseUnit?.packageMeasurementUnitId);
       purchaseLines.push({
         itemId: inventoryItem._id,
         itemName: inventoryItem.name,
         quantity: Number(line.quantity),
         unit: purchaseUnit,
         unitId: requestedUnit._id,
+        purchasePackageId: packageConfigured ? configuredPurchaseUnit._id : null,
+        packageNameSnapshot: packageConfigured ? configuredPurchaseUnit.packageName || configuredPurchaseUnit.unitNameSnapshot : '',
+        unitNameSnapshot: packageConfigured
+          ? configuredPurchaseUnit.packageName || configuredPurchaseUnit.unitNameSnapshot
+          : configuredPurchaseUnit?.unitNameSnapshot || requestedUnit.name,
+        unitSymbolSnapshot: configuredPurchaseUnit?.unitSymbolSnapshot || requestedUnit.symbol,
         baseUnit: inventoryItem.baseUnit || inventoryItem.unit,
         baseUnitId: inventoryItem.baseUnitId || null,
+        baseUnitNameSnapshot: baseUnitRecord?.name || inventoryItem.baseUnit || inventoryItem.unit,
+        baseUnitSymbolSnapshot: baseUnitRecord?.symbol || inventoryItem.baseUnit || inventoryItem.unit,
         conversionFactor,
         unitCost: Number(line.unitCost),
         totalAmount: Number(line.quantity) * Number(line.unitCost)
@@ -760,10 +1429,16 @@ export const receivePurchaseOrder = async (req, res, next) => {
         poLine.receivedQuantity = (poLine.receivedQuantity || 0) + receivedQuantity;
         lines.push({
           itemId: poLine.itemId,
+          purchasePackageId: poLine.purchasePackageId || null,
+          packageNameSnapshot: poLine.packageNameSnapshot || '',
           unit: poLine.unit || '',
           unitId: poLine.unitId || null,
+          unitNameSnapshot: poLine.unitNameSnapshot || poLine.unit || '',
+          unitSymbolSnapshot: poLine.unitSymbolSnapshot || poLine.unit || '',
           baseUnit: poLine.baseUnit || '',
           baseUnitId: poLine.baseUnitId || null,
+          baseUnitNameSnapshot: poLine.baseUnitNameSnapshot || poLine.baseUnit || '',
+          baseUnitSymbolSnapshot: poLine.baseUnitSymbolSnapshot || poLine.baseUnit || '',
           conversionFactor: poLine.conversionFactor || 1,
           receivedQuantity,
           acceptedQuantity,
@@ -783,6 +1458,9 @@ export const receivePurchaseOrder = async (req, res, next) => {
             unit: poLine.unit,
             unitId: poLine.unitId,
             conversionFactor: poLine.conversionFactor || 1,
+            purchasePackageId: poLine.purchasePackageId || null,
+            purchasePackageName: poLine.packageNameSnapshot || '',
+            purchasePackageSnapshot: Boolean(poLine.purchasePackageId),
             unitCost: poLine.unitCost / (poLine.conversionFactor || 1),
             location: req.body.location || 'Main Store',
             referenceNumber: currentPO.poNumber,

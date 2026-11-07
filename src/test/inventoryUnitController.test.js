@@ -134,7 +134,7 @@ describe('inventory unit management API', () => {
         code: 'RICE-STOCK',
         baseUnitId: gram._id,
         purchaseUnitId: bag._id,
-        conversionFactor: 25000,
+        conversionFactor: 25010,
         currentStock: 0,
         minStockThreshold: 0,
         purchasePrice: 500
@@ -143,7 +143,7 @@ describe('inventory unit management API', () => {
     expect(created.statusCode).toBe(201);
     expect(created.body.data.baseUnitId.toString()).toBe(gram._id.toString());
     expect(created.body.data.purchaseUnitId.toString()).toBe(bag._id.toString());
-    expect(created.body.data.purchaseConversionFactor).toBe(25000);
+    expect(created.body.data.purchaseConversionFactor).toBe(25010);
 
     const received = await runInventoryTransaction((session) => postStockMovement({
       hotelId,
@@ -156,9 +156,9 @@ describe('inventory unit management API', () => {
       recordedBy: actorId,
       session
     }));
-    expect(received.item.currentStock).toBe(75000);
+    expect(received.item.currentStock).toBe(75030);
     expect(received.movement.enteredUnitId.toString()).toBe(bag._id.toString());
-    expect(received.movement.conversionFactor).toBe(25000);
+    expect(received.movement.conversionFactor).toBe(25010);
     expect(await StockMovement.countDocuments({ itemId: created.body.data._id })).toBe(1);
   });
 });

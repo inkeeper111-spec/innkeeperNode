@@ -1,11 +1,11 @@
-import dns from 'dns';
+﻿import 'dotenv/config';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js';
 
-dns.setServers(['192.168.0.1', '8.8.8.8', '1.1.1.1']);
+const uri = process.env.MONGODB_URI;
+if (!uri) throw new Error('MONGODB_URI is required to run this utility.');
 
-const uri = process.env.MONGODB_URI || 'mongodb+srv://ranjithraja325:Thottam123@cluster0.2bgzz.mongodb.net/hotel';
 const candidates = [
   'AdminPassword123!',
   'HotelPassword123!',

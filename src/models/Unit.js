@@ -9,8 +9,11 @@ const unitSchema = new mongoose.Schema({
   category: {
     type: String,
     required: true,
-    enum: ['weight', 'volume', 'quantity', 'length', 'area', 'other']
+    enum: ['weight', 'volume', 'quantity', 'package', 'length', 'area', 'other']
   },
+  isStandard: { type: Boolean, default: false },
+  baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null, index: true },
+  conversionFactor: { type: Number, min: 0.000000001, default: null },
   description: { type: String, trim: true, default: '' },
   isActive: { type: Boolean, default: true, index: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },

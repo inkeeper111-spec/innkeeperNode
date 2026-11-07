@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import {
-  InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, RecipeConsumption, StockMovement, Unit
+  Hotel, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, RecipeConsumption, StockMovement, Unit
 } from '../models/index.js';
 import { convertQuantityToBase } from '../config/inventoryUnits.js';
 
@@ -46,9 +46,18 @@ export const postStockMovement = async ({
   movementType,
   quantity,
   unit,
+  batchIds,
   unitId,
   conversionFactor,
+  purchasePackageId = null,
+  purchasePackageName = '',
+  purchasePackageSnapshot = false,
+  packageQuantity = null,
+  looseQuantity = 0,
   unitCost: unitCostOverride,
+  purchaseUnitPrice = null,
+  vendorId = null,
+  autoGenerateBatchNumber = false,
   location = 'Main Store',
   department = '',
   referenceNumber = '',
@@ -64,11 +73,8 @@ export const postStockMovement = async ({
   metadata = {},
   session
 }) => {
-  const numericQuantity = Number(quantity);
+  let numericQuantity = Number(quantity);
   const isStockCount = movementType === 'adjustment' || movementType === 'physical_count';
-  if (!Number.isFinite(numericQuantity) || numericQuantity < 0 || (numericQuantity === 0 && !isStockCount)) {
-    throw Object.assign(new Error(isStockCount ? 'Counted stock cannot be negative.' : 'Quantity must be a positive number.'), { statusCode: 400 });
-  }
 
   if (idempotencyKey) {
     const existing = await StockMovement.findOne({ hotelId, propertyId, idempotencyKey }).session(session);
@@ -77,8 +83,46 @@ export const postStockMovement = async ({
 
   const item = await InventoryItem.findOne({ _id: itemId, hotelId, propertyId, isActive: true }).session(session);
   if (!item) throw Object.assign(new Error('Active inventory item not found.'), { statusCode: 404 });
-  const enteredUnit = unit || item.baseUnit || item.unit;
-  const configuredUnitId = unitId || unitIdForSymbol(item, enteredUnit);
+  const hasPackageQuantity = packageQuantity !== null && packageQuantity !== undefined;
+  if ((purchasePackageId && !hasPackageQuantity && !purchasePackageSnapshot)
+    || (hasPackageQuantity && !purchasePackageId)) {
+    throw Object.assign(new Error('A configured package and package quantity must be provided together.'), { statusCode: 400 });
+  }
+  const purchasePackage = purchasePackageId && hasPackageQuantity
+    ? item.supportedUnits.id(String(purchasePackageId))
+    : null;
+  let enteredQuantity = numericQuantity;
+  let enteredUnit = purchasePackageName || unit || item.baseUnit || item.unit;
+  let conversionFactorOverride = conversionFactor;
+  let recordedLooseQuantity = 0;
+  let configuredUnitId = unitId || unitIdForSymbol(item, enteredUnit);
+  if (purchasePackageId && hasPackageQuantity) {
+    const packageCount = Number(packageQuantity);
+    recordedLooseQuantity = Number(looseQuantity);
+    if (movementType !== 'receipt' || item.inventoryType !== 'raw_material'
+      || !purchasePackage || purchasePackage.isActive === false
+      || !(Number(purchasePackage.packageSize) > 0)
+      || !purchasePackage.packageMeasurementUnitId
+      || !Number.isFinite(packageCount) || packageCount < 0
+      || !Number.isFinite(recordedLooseQuantity) || recordedLooseQuantity < 0
+      || (packageCount === 0 && recordedLooseQuantity === 0)
+      || !(Number(purchasePackage.conversionFactorToBase) > 0)) {
+      throw Object.assign(new Error('Choose a configured package and enter a positive package or loose quantity.'), { statusCode: 400 });
+    }
+    enteredQuantity = packageCount;
+    enteredUnit = purchasePackage.packageName || purchasePackage.unitNameSnapshot;
+    conversionFactorOverride = Number(purchasePackage.conversionFactorToBase);
+    numericQuantity = packageCount * conversionFactorOverride + recordedLooseQuantity;
+    if (!Number.isFinite(numericQuantity) || numericQuantity <= 0) {
+      throw Object.assign(new Error('Converted stock quantity must be greater than zero.'), { statusCode: 400 });
+    }
+    configuredUnitId = purchasePackage.unitId;
+    unit = item.baseUnit || item.unit;
+    conversionFactorOverride = 1;
+  }
+  if (!Number.isFinite(numericQuantity) || numericQuantity < 0 || (numericQuantity === 0 && !isStockCount)) {
+    throw Object.assign(new Error(isStockCount ? 'Counted stock cannot be negative.' : 'Quantity must be a positive number.'), { statusCode: 400 });
+  }
   let enteredUnitRecord;
   if (configuredUnitId) {
     enteredUnitRecord = await Unit.findOne({ _id: configuredUnitId, hotelId }).session(session);
@@ -98,7 +142,36 @@ export const postStockMovement = async ({
       throw Object.assign(new Error('Stock movement units must be compatible with the inventory item base unit.'), { statusCode: 400 });
     }
   }
-  const converted = convertQuantityToBase(item, numericQuantity, enteredUnit, conversionFactor);
+  const converted = convertQuantityToBase(item, numericQuantity, unit || enteredUnit, conversionFactorOverride);
+  const purchasePrice = purchaseUnitPrice === null || purchaseUnitPrice === undefined
+    ? null
+    : Number(purchaseUnitPrice);
+  if (purchasePrice !== null && (!Number.isFinite(purchasePrice) || purchasePrice < 0)) {
+    throw Object.assign(new Error('Purchase price must be a non-negative number.'), { statusCode: 400 });
+  }
+  if (autoGenerateBatchNumber && movementType === 'receipt' && !batchNumber) {
+    const hotel = await Hotel.findById(hotelId).select('name').session(session);
+    if (!hotel?.name) {
+      throw Object.assign(new Error('Hotel name is required to generate a stock batch number.'), { statusCode: 400 });
+    }
+    const hotelCode = hotel.name.replace(/[^a-z0-9]/gi, '').slice(0, 3).toUpperCase() || 'HTL';
+    const itemCode = item.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'item';
+    const existingBatchNumbers = await InventoryBatch.find({ hotelId, propertyId, itemId: item._id })
+      .select('batchNumber')
+      .session(session)
+      .lean();
+    const latestSequence = existingBatchNumbers.reduce((latest, batch) => {
+      const match = String(batch.batchNumber || '').match(/_B(\d+)$/i);
+      return match ? Math.max(latest, Number(match[1])) : latest;
+    }, 0);
+    let nextSequence = latestSequence + 1;
+    const existingNumbers = new Set(existingBatchNumbers.map((batch) => batch.batchNumber));
+    batchNumber = `${hotelCode}_${itemCode}_B${nextSequence}`;
+    while (existingNumbers.has(batchNumber)) {
+      nextSequence += 1;
+      batchNumber = `${hotelCode}_${itemCode}_B${nextSequence}`;
+    }
+  }
   const enteredUnitId = enteredUnitRecord?._id || configuredUnitId || null;
   const baseQuantity = roundQuantity(converted.quantity);
   const locationBalance = isStockCount
@@ -109,7 +182,9 @@ export const postStockMovement = async ({
     : movementType === 'adjustment' || movementType === 'physical_count'
       ? baseQuantity - currentLocationStock
       : -baseQuantity;
-  const receiptUnitCost = Number.isFinite(Number(unitCostOverride)) ? Number(unitCostOverride) : item.unitCost;
+  const receiptUnitCost = purchasePrice !== null
+    ? purchasePrice / converted.factor
+    : Number.isFinite(Number(unitCostOverride)) ? Number(unitCostOverride) : item.unitCost;
   if (delta > 0 && item.trackExpiry && !expiryDate) {
     throw Object.assign(new Error(`An expiry date is required for ${item.name}.`), { statusCode: 400 });
   }
@@ -130,6 +205,7 @@ export const postStockMovement = async ({
       itemId: item._id,
       location,
       remainingQuantity: { $gt: 0 },
+      ...(Array.isArray(batchIds) ? { _id: { $in: batchIds } } : {}),
       ...(movementType === 'expiry'
         ? { expiryDate: { $lte: now } }
         : { $or: [{ expiryDate: null }, { expiryDate: { $gt: now } }] })
@@ -213,6 +289,13 @@ export const postStockMovement = async ({
       remainingQuantity: delta,
       unitCost: receiptUnitCost,
       expiryDate,
+      ...(vendorId ? { vendorId } : {}),
+      ...(purchasePrice !== null ? {
+        purchaseQuantity: enteredQuantity,
+        purchaseUnit: enteredUnit,
+        purchaseUnitCost: purchasePrice,
+        purchaseAmount: round(enteredQuantity * purchasePrice)
+      } : {}),
       ...batchDetails,
       ...(receivedAt ? { receivedAt } : {})
     }], { session });
@@ -238,15 +321,20 @@ export const postStockMovement = async ({
     recordedBy,
     location,
     department,
+    vendorId,
+    purchaseUnitPrice: purchasePrice,
     idempotencyKey,
     orderId,
     batchNumber,
     expiryDate,
     batchAllocations,
-    enteredQuantity: numericQuantity,
-    enteredUnit: converted.unit,
+    enteredQuantity,
+    enteredUnit: purchasePackage || purchasePackageName ? enteredUnit : converted.unit,
     enteredUnitId,
-    conversionFactor: converted.factor,
+    purchasePackageId: purchasePackage?._id || purchasePackageId || null,
+    purchasePackageName: purchasePackage?.packageName || purchasePackageName || '',
+    looseQuantity: recordedLooseQuantity,
+    conversionFactor: purchasePackage ? Number(purchasePackage.conversionFactorToBase) : converted.factor,
     baseUnit: item.baseUnit || item.unit,
     baseUnitId: item.baseUnitId || null,
     metadata: { ...metadata, locationPreviousStock: balanceMovement.previous, locationNewStock: balanceMovement.current }

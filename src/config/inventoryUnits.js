@@ -20,16 +20,24 @@ export const INVENTORY_UNIT_MASTER = [
     category: 'Quantity',
     units: [
       { unit: 'pcs', label: 'Piece (pcs)', factor: 1 },
+      { unit: 'nos', label: 'Number (nos)', factor: 1 },
       { unit: 'dozen', label: 'Dozen', factor: 12 },
-      { unit: 'pair', label: 'Pair', factor: 2 },
-      { unit: 'box', label: 'Box', factor: null },
+      { unit: 'pair', label: 'Pair', factor: 2 }
+    ]
+  },
+  {
+    category: 'Package',
+    units: [
       { unit: 'packet', label: 'Packet', factor: null },
+      { unit: 'bag', label: 'Bag', factor: null },
       { unit: 'carton', label: 'Carton', factor: null },
+      { unit: 'box', label: 'Box', factor: null },
       { unit: 'tray', label: 'Tray', factor: null },
       { unit: 'set', label: 'Set', factor: null },
       { unit: 'bottle', label: 'Bottle', factor: null },
       { unit: 'can', label: 'Can', factor: null },
-      { unit: 'bag', label: 'Bag', factor: null },
+      { unit: 'tin', label: 'Tin', factor: null },
+      { unit: 'bundle', label: 'Bundle', factor: null },
       { unit: 'roll', label: 'Roll', factor: null }
     ]
   },

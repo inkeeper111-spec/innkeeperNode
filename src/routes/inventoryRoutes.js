@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import {
   getInventoryItems,
+  getInventoryBatches,
+  getStockReceiptRequests,
+  createStockReceiptRequest,
+  reviewStockReceiptRequest,
   createInventoryItem,
   updateInventoryItem,
   recordStockMovement,
@@ -21,6 +25,17 @@ import {
   getInventoryUnits,
   updateInventoryUnit
 } from '../controllers/inventoryUnitController.js';
+import {
+  createRawMaterial,
+  createRawMaterialCategory,
+  createRawMaterialSubcategory,
+  getRawMaterialCategories,
+  getRawMaterials,
+  getRawMaterialSubcategories,
+  updateRawMaterial,
+  updateRawMaterialCategory,
+  updateRawMaterialSubcategory
+} from '../controllers/rawMaterialController.js';
 import {
   approvePurchaseOrder,
   assignMinibarStock,
@@ -58,6 +73,19 @@ router.use(authenticate);
 router.use(requireTenant);
 
 router.get('/items', getInventoryItems);
+router.get('/batches', getInventoryBatches);
+router.get('/stock-receipt-requests', getStockReceiptRequests);
+router.post('/stock-receipt-requests', createStockReceiptRequest);
+router.patch('/stock-receipt-requests/:id/review', reviewStockReceiptRequest);
+router.get('/raw-materials/categories', authorize(ROLES.HOTEL_ADMIN), getRawMaterialCategories);
+router.post('/raw-materials/categories', authorize(ROLES.HOTEL_ADMIN), createRawMaterialCategory);
+router.patch('/raw-materials/categories/:id', authorize(ROLES.HOTEL_ADMIN), updateRawMaterialCategory);
+router.get('/raw-materials/subcategories', authorize(ROLES.HOTEL_ADMIN), getRawMaterialSubcategories);
+router.post('/raw-materials/subcategories', authorize(ROLES.HOTEL_ADMIN), createRawMaterialSubcategory);
+router.patch('/raw-materials/subcategories/:id', authorize(ROLES.HOTEL_ADMIN), updateRawMaterialSubcategory);
+router.get('/raw-materials', getRawMaterials);
+router.post('/raw-materials', authorize(ROLES.HOTEL_ADMIN), createRawMaterial);
+router.patch('/raw-materials/:id', authorize(ROLES.HOTEL_ADMIN), updateRawMaterial);
 router.get('/units', getInventoryUnits);
 router.post('/units', authorize(ROLES.HOTEL_ADMIN), createInventoryUnit);
 router.post('/units/defaults', authorize(ROLES.HOTEL_ADMIN), createDefaultInventoryUnits);

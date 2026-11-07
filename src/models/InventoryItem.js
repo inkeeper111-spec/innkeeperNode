@@ -35,6 +35,32 @@ const inventoryItemSchema = new mongoose.Schema({
     ],
     default: 'food_beverage'
   },
+  inventoryType: {
+    type: String,
+    enum: ['stock_item', 'raw_material'],
+    default: 'stock_item',
+    index: true
+  },
+  categoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'RawMaterialCategory', default: null, index: true },
+  subcategoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'RawMaterialSubcategory', default: null, index: true },
+  storageType: { type: String, trim: true, default: '' },
+  reorderLevel: { type: Number, min: 0, default: 0 },
+  preferredPurchaseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  supportedUnits: [{
+    unitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', required: true },
+    unitNameSnapshot: { type: String, required: true, trim: true },
+    unitSymbolSnapshot: { type: String, required: true, trim: true },
+    packageName: { type: String, trim: true, default: '' },
+    packageSize: { type: Number, min: 0, default: null },
+    packageMeasurementUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+    packageMeasurementUnitNameSnapshot: { type: String, trim: true, default: '' },
+    packageMeasurementUnitSymbolSnapshot: { type: String, trim: true, default: '' },
+    conversionFactorToBase: { type: Number, required: true, min: 0.000000001 },
+    isDefaultPurchaseUnit: { type: Boolean, default: false },
+    isActive: { type: Boolean, default: true }
+  }],
   unit: {
     type: String,
     trim: true,
@@ -105,6 +131,7 @@ const inventoryItemSchema = new mongoose.Schema({
 });
 
 inventoryItemSchema.index({ hotelId: 1, propertyId: 1, code: 1 }, { unique: true });
+inventoryItemSchema.index({ hotelId: 1, propertyId: 1, inventoryType: 1, isActive: 1, name: 1 });
 
 inventoryItemSchema.pre('validate', function setBaseUnit() {
   if (!this.baseUnit) this.baseUnit = this.unit || 'pcs';

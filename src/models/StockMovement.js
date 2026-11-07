@@ -36,6 +36,9 @@ const stockMovementSchema = new mongoose.Schema({
   enteredQuantity: { type: Number, min: 0, default: null },
   enteredUnit: { type: String, trim: true, default: '' },
   enteredUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
+  purchasePackageId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  purchasePackageName: { type: String, trim: true, default: '' },
+  looseQuantity: { type: Number, min: 0, default: 0 },
   conversionFactor: { type: Number, min: 0, default: 1 },
   baseUnit: { type: String, trim: true, default: '' },
   baseUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit', default: null },
@@ -70,6 +73,8 @@ const stockMovementSchema = new mongoose.Schema({
   location: { type: String, trim: true, default: 'Main Store' },
   destinationLocation: { type: String, trim: true, default: '' },
   department: { type: String, trim: true, default: '' },
+  vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor', default: null },
+  purchaseUnitPrice: { type: Number, min: 0, default: null },
   idempotencyKey: { type: String, default: undefined },
   batchAllocations: [{
     batchId: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryBatch', default: null },

@@ -16,8 +16,8 @@ export const connectDB = async () => {
     for (let i = 1; i <= attempts; i++) {
       try {
         await mongoose.connect(uri, {
-          serverSelectionTimeoutMS: 15000,
-          connectTimeoutMS: 15000
+          serverSelectionTimeoutMS: 15010,
+          connectTimeoutMS: 15010
         });
         logger.info(`MongoDB connected: ${uri.replace(/\/\/.*@/, '//***@')}`);
         return;

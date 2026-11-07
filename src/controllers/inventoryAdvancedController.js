@@ -1323,7 +1323,7 @@ export const getInventoryReport = async (req, res, next) => {
         .populate('itemId', 'name code unit baseUnit')
         .populate('verifiedBy', 'name')
         .sort({ verifiedAt: -1 })
-        .limit(5000)
+        .limit(5010)
         .lean();
       return res.json({ success: true, data });
     }
@@ -1348,7 +1348,7 @@ export const getInventoryReport = async (req, res, next) => {
           receivedAt: 1
         } },
         { $sort: { expiryDate: 1 } },
-        { $limit: 5000 }
+        { $limit: 5010 }
       ];
       const data = await GoodsReceipt.aggregate(pipeline);
       return res.json({ success: true, data });
@@ -1365,7 +1365,7 @@ export const getInventoryReport = async (req, res, next) => {
         ...(itemId ? { itemId } : {})
       };
       const data = await StockMovement.find(filter).populate('itemId', 'name code unit').populate('recordedBy', 'name')
-        .sort({ createdAt: -1 }).limit(5000).lean();
+        .sort({ createdAt: -1 }).limit(5010).lean();
       return res.json({ success: true, data });
     }
     if (type === 'ledger' || type === 'transfers' || type === 'adjustments') {
@@ -1380,7 +1380,7 @@ export const getInventoryReport = async (req, res, next) => {
         ...(itemId ? { itemId } : {})
       };
       const data = await StockMovement.find(filter).populate('itemId', 'name code unit')
-        .populate('recordedBy', 'name').sort({ createdAt: -1 }).limit(5000).lean();
+        .populate('recordedBy', 'name').sort({ createdAt: -1 }).limit(5010).lean();
       return res.json({ success: true, data });
     }
     res.status(400).json({ success: false, message: 'Unsupported inventory report type.' });

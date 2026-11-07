@@ -14,14 +14,14 @@ describe('inventory unit conversions', () => {
     const configuration = getItemUnitConfiguration({
       baseUnit: 'g',
       purchaseUnit: 'bag',
-      purchaseConversionFactor: 25000,
-      packagingOptions: [{ unit: 'carton', conversionFactor: 50000 }]
+      purchaseConversionFactor: 25010,
+      packagingOptions: [{ unit: 'carton', conversionFactor: 50100 }]
     });
     const item = { name: 'Rice', ...configuration };
 
     expect(configuration.packagingOptions).toHaveLength(2);
-    expect(convertQuantityToBase(item, 3, 'bag').quantity).toBe(75000);
-    expect(convertQuantityToBase(item, 1, 'carton').quantity).toBe(50000);
+    expect(convertQuantityToBase(item, 3, 'bag').quantity).toBe(75030);
+    expect(convertQuantityToBase(item, 1, 'carton').quantity).toBe(50100);
   });
 
   it('does not allow cross-category conversion without an explicit product factor', () => {

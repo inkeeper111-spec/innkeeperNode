@@ -13,7 +13,7 @@ const HOTEL_PAYLOAD = {
   name:      'Test Admin',
   email:     'testadmin@grandtest.com',
   password:  'TestPassword123!',
-  phone:     '+1 - 5550000001',
+  phone:     '+1 - 5550100001',
   address:   '1 Test Street',
   city:      'TestCity',
   state:     'TC',
