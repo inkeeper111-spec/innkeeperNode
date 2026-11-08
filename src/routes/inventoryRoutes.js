@@ -56,6 +56,7 @@ import {
   updateInventorySettings,
   reviewDepartmentRequest,
   saveRecipe,
+  setRecipeStatus,
   reconcileMinibar,
   transferStockBetweenLocations
 } from '../controllers/inventoryAdvancedController.js';
@@ -120,6 +121,7 @@ router.patch('/department-requests/:id/review', reviewDepartmentRequest);
 
 router.get('/recipes', getRecipes);
 router.post('/recipes', authorize(ROLES.HOTEL_ADMIN), saveRecipe);
+router.patch('/recipes/:id/status', authorize(ROLES.HOTEL_ADMIN), setRecipeStatus);
 router.get('/minibar/rooms', getMinibarRooms);
 router.get('/minibar/rooms/:roomId', getMinibarRoomStock);
 router.post('/minibar/rooms/:roomId/stock', assignMinibarStock);

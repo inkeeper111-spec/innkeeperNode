@@ -173,7 +173,7 @@ describe('raw material inventory workflow', () => {
     });
   });
 
-  it('allocates legacy consumption, wastage, and physical counts to the available item batch', async () => {
+  it('classifies recipe consumption as profitable and separately allocates wastage and physical counts', async () => {
     const isolatedHotelId = new mongoose.Types.ObjectId();
     const isolatedPropertyId = new mongoose.Types.ObjectId();
     const item = await createItem();
@@ -263,15 +263,14 @@ describe('raw material inventory workflow', () => {
       materialName: item.name,
       expectedStock: 10,
       actualUsableStock: 3,
-      unrecordedConsumptionQuantity: 4,
-      consumedProfitablyQuantity: 1,
+      unrecordedConsumptionQuantity: 0,
+      consumedProfitablyQuantity: 4,
       uploadedQuantity: 10,
-      consumedQuantity: 4,
+      consumedQuantity: 0,
       wastageQuantity: 2,
       unrecordedQuantity: 1,
       remainingQuantity: 3,
-      salesRevenue: 90,
-      profit: 70,
+      salesRevenue: 20,
       loss: 15,
       wastageLoss: 10,
       unrecordedLoss: 5
@@ -336,10 +335,149 @@ describe('raw material inventory workflow', () => {
       uploadedQuantity: 7,
       consumedQuantity: 0.5,
       wastageQuantity: 0.5,
-      unrecordedQuantity: 4,
+      consumedProfitablyQuantity: 4,
+      unrecordedQuantity: 0,
+      salesRevenue: 40,
+      loss: 5,
+      wastageLoss: 5,
+      unrecordedLoss: 0,
       actualUsableStock: 2,
       remainingQuantity: 2
     });
+  });
+
+  it('prices profitable consumption as sales revenue and excludes it from batch loss', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await createItem();
+    item.hotelId = isolatedHotelId;
+    item.propertyId = isolatedPropertyId;
+    item.unit = 'kg';
+    item.baseUnit = 'kg';
+    item.purchaseUnit = 'kg';
+    await item.save();
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      quantity: 10,
+      unit: 'kg',
+      unitCost: 1,
+      location: 'Main Store',
+      referenceNumber: 'PROFITABLE-CONSUMPTION-RECEIPT',
+      session
+    }));
+
+    const today = new Date().toISOString().slice(0, 10);
+    await invoke(createStockVerification, {
+      ...requestFor({
+        itemId: String(item._id),
+        location: 'Main Store',
+        actualStock: 0.9,
+        unit: 'kg',
+        periodStart: today,
+        periodEnd: today,
+        wastageQuantity: 0.1,
+        wastageUnit: 'kg',
+        wastageReason: 'Spoiled'
+      }),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+
+    const response = await invoke(getInventoryBatches, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: { itemId: String(item._id), location: 'Main Store' }
+    });
+    const [batch] = response.body.data;
+
+    expect(batch).toMatchObject({
+      consumedProfitablyQuantity: 9,
+      wastageQuantity: 0.1,
+      unrecordedQuantity: 0,
+      salesRevenue: 9,
+      wastageLoss: 0.1,
+      unrecordedLoss: 0,
+      loss: 0.1
+    });
+    expect(batch).not.toHaveProperty('profit');
+  });
+
+  it('uses the current balance for batch usable stock after a later receipt and retains fractional base-unit cost', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await createItem();
+    item.hotelId = isolatedHotelId;
+    item.propertyId = isolatedPropertyId;
+    item.unit = 'g';
+    item.baseUnit = 'g';
+    item.purchaseUnit = 'kg';
+    item.purchaseConversionFactor = 1000;
+    await item.save();
+
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      quantity: 10,
+      unit: 'kg',
+      purchaseUnitPrice: 1,
+      batchNumber: 'THE_beetroot_B1',
+      location: 'Main Store',
+      referenceNumber: 'BEETROOT-FIRST-BATCH',
+      session
+    }));
+
+    const today = new Date().toISOString().slice(0, 10);
+    await invoke(createStockVerification, {
+      ...requestFor({
+        itemId: String(item._id),
+        location: 'Main Store',
+        actualStock: 500,
+        unit: 'g',
+        periodStart: today,
+        periodEnd: today
+      }),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      quantity: 20,
+      unit: 'kg',
+      purchaseUnitPrice: 2,
+      batchNumber: 'THE_beetroot_B2',
+      location: 'Main Store',
+      referenceNumber: 'BEETROOT-SECOND-BATCH',
+      session
+    }));
+
+    const response = await invoke(getInventoryBatches, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: { itemId: String(item._id), location: 'Main Store' }
+    });
+    const secondBatch = response.body.data.find((batch) => batch.batchNumber === 'THE_beetroot_B2');
+
+    expect(secondBatch).toMatchObject({
+      quantity: 20000,
+      remainingQuantity: 20000,
+      actualUsableStock: 20000,
+      purchaseUnitCost: 2,
+      purchaseAmount: 40
+    });
+    expect(secondBatch.unitCost).toBe(0.002);
   });
 
   it('records an authorized stock adjustment immediately and rejects unauthorized changes', async () => {
@@ -1133,7 +1271,7 @@ describe('raw material inventory workflow', () => {
     expect(response.body.data.verification.consumptionReason).toBe('Used for staff meals');
     expect(response.body.data.verification.wastageReason).toBe('Spoiled during storage');
     expect(response.body.data.verification.discrepancyQuantity).toBe(3);
-    expect(response.body.data.verification.discrepancyReason).toBe('Profitably consumed');
+    expect(response.body.data.verification.discrepancyReason).toBe('');
     expect(response.body.data.verification.status).toBe('approved');
     expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(2);
     expect(await StockMovement.findOne({ itemId: item._id, movementType: 'issue' }).then((movement) => movement.notes))
@@ -1148,7 +1286,78 @@ describe('raw material inventory workflow', () => {
       itemId: item._id,
       movementType: { $in: ['issue', 'wastage', 'physical_count'] }
     })).toBe(3);
+  });
+
+  it('records a stock gain without requiring or storing a reason', async () => {
+    const item = await createItem();
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId,
+      propertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      quantity: 2,
+      unit: 'kg',
+      unitCost: 60,
+      location: 'Main Store',
+      referenceNumber: 'GAIN-WITHOUT-REASON',
+      session
+    }));
+    const today = new Date().toISOString().slice(0, 10);
+
+    const response = await invoke(createStockVerification, {
+      ...requestFor({
+        itemId: String(item._id),
+        actualStock: 3,
+        unit: 'kg',
+        periodStart: today,
+        periodEnd: today
+      }),
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.body.data.verification.stockGain).toBe(1);
+    expect(response.body.data.verification.discrepancyReason).toBe('');
     expect(await StockVerification.countDocuments({ itemId: item._id })).toBe(1);
+  });
+
+  it('allows multiple stock verifications for the same item and date', async () => {
+    const item = await createItem();
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId,
+      propertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      quantity: 2,
+      unit: 'kg',
+      unitCost: 60,
+      location: 'Main Store',
+      referenceNumber: 'SAME-DAY-VERIFY-RECEIPT',
+      session
+    }));
+    const today = new Date().toISOString().slice(0, 10);
+    const verificationBody = {
+      itemId: String(item._id),
+      location: 'Main Store',
+      actualStock: 2,
+      unit: 'kg',
+      periodStart: today,
+      periodEnd: today
+    };
+
+    const first = await invoke(createStockVerification, {
+      ...requestFor(verificationBody),
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+    const second = await invoke(createStockVerification, {
+      ...requestFor(verificationBody),
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(201);
+    expect(second.body.data.verification._id).not.toBe(first.body.data.verification._id);
+    expect(await StockVerification.countDocuments({ itemId: item._id, periodEnd: new Date(today) })).toBe(2);
   });
 
   it('reports period purchases and closing batch value as of the selected end date', async () => {

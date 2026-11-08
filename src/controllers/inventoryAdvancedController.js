@@ -165,6 +165,7 @@ export const getInventorySettings = async (req, res, next) => {
       success: true,
       data: settings || {
         verificationIntervalDays: 1,
+        recipeDeductionStage: 'prepared',
         hotelId: req.hotelId,
         propertyId: req.propertyId
       }
@@ -177,13 +178,26 @@ export const getInventorySettings = async (req, res, next) => {
 export const updateInventorySettings = async (req, res, next) => {
   try {
     if (!adminOnly(req, res)) return;
-    const verificationIntervalDays = Number(req.body.verificationIntervalDays);
-    if (!Number.isInteger(verificationIntervalDays) || verificationIntervalDays < 1 || verificationIntervalDays > 365) {
-      return res.status(400).json({ success: false, message: 'Verification interval must be a whole number from 1 to 365 days.' });
+    const updates = {};
+    if (req.body.verificationIntervalDays !== undefined) {
+      const verificationIntervalDays = Number(req.body.verificationIntervalDays);
+      if (!Number.isInteger(verificationIntervalDays) || verificationIntervalDays < 1 || verificationIntervalDays > 365) {
+        return res.status(400).json({ success: false, message: 'Verification interval must be a whole number from 1 to 365 days.' });
+      }
+      updates.verificationIntervalDays = verificationIntervalDays;
+    }
+    if (req.body.recipeDeductionStage !== undefined) {
+      if (!['prepared', 'served'].includes(req.body.recipeDeductionStage)) {
+        return res.status(400).json({ success: false, message: 'Recipe deduction stage must be prepared or served.' });
+      }
+      updates.recipeDeductionStage = req.body.recipeDeductionStage;
+    }
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ success: false, message: 'Provide an inventory setting to update.' });
     }
     const settings = await InventorySettings.findOneAndUpdate(
       tenantFilter(req),
-      { $set: { verificationIntervalDays, updatedBy: req.user._id } },
+      { $set: { ...updates, updatedBy: req.user._id } },
       { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
     );
     await logAudit({
@@ -191,7 +205,7 @@ export const updateInventorySettings = async (req, res, next) => {
       action: 'UPDATE_INVENTORY_SETTINGS',
       entity: 'InventorySettings',
       entityId: settings._id,
-      details: { verificationIntervalDays },
+      details: updates,
       req
     });
     res.json({ success: true, data: settings });
@@ -289,15 +303,6 @@ export const createStockVerification = async (req, res, next) => {
       );
       const stockGain = Math.max(0, delta);
       const discrepancyLabel = discrepancyQuantity > 0 ? 'Profitably consumed' : stockGain > 0 ? 'Stock gain' : '';
-      const duplicatePeriod = await StockVerification.exists({
-        ...tenantFilter(req),
-        itemId: item._id,
-        location: String(location).trim(),
-        periodEnd: end
-      }).session(session);
-      if (duplicatePeriod) {
-        throw Object.assign(new Error('This raw material already has a stock verification ending on that date.'), { statusCode: 409 });
-      }
       const [verification] = await StockVerification.create([{
         ...tenantFilter(req),
         itemId: item._id,
@@ -313,7 +318,6 @@ export const createStockVerification = async (req, res, next) => {
         discrepancyQuantity,
         stockGain,
         unit: item.baseUnit || item.unit,
-        discrepancyReason: discrepancyLabel,
         remarks: String(remarks).trim(),
         status: 'approved',
         verifiedBy: req.user._id,
@@ -1066,7 +1070,42 @@ export const getRecipes = async (req, res, next) => {
       .populate('ingredients.substitutions.itemId', 'name code unit baseUnit')
       .sort({ menuItemId: 1, version: -1 })
       .lean();
-    res.json({ success: true, data: recipes });
+    const itemIds = [...new Set(recipes.flatMap((recipe) => recipe.ingredients.map((ingredient) => (
+      String(ingredient.itemId?._id || ingredient.itemId)
+    ))))].filter((id) => mongoose.isValidObjectId(id));
+    const batchCosts = itemIds.length ? await InventoryBatch.aggregate([
+      { $match: { ...tenantFilter(req), itemId: { $in: itemIds.map((id) => new mongoose.Types.ObjectId(id)) }, remainingQuantity: { $gt: 0 } } },
+      { $group: {
+        _id: '$itemId',
+        quantity: { $sum: '$remainingQuantity' },
+        value: { $sum: { $multiply: ['$remainingQuantity', '$unitCost'] } }
+      } }
+    ]) : [];
+    const unitCosts = new Map(batchCosts.map((batch) => [
+      String(batch._id),
+      batch.quantity > 0 ? batch.value / batch.quantity : 0
+    ]));
+    const data = recipes.map((recipe) => {
+      const estimatedRecipeCost = recipe.ingredients.reduce((total, ingredient) => {
+        if (ingredient.optional) return total;
+        const item = ingredient.itemId;
+        const baseUnitCost = unitCosts.get(String(item?._id)) ?? Number(item?.unitCost || 0);
+        return total + Number(ingredient.quantity || 0)
+          * Number(ingredient.conversionFactor || 1) * baseUnitCost;
+      }, 0);
+      const sellingPrice = Number(recipe.menuItemId?.price || 0);
+      return {
+        ...recipe,
+        estimatedRecipeCost,
+        costPerServing: estimatedRecipeCost,
+        sellingPrice,
+        estimatedGrossProfit: sellingPrice - estimatedRecipeCost,
+        foodCostPercent: sellingPrice > 0
+          ? Math.round((estimatedRecipeCost / sellingPrice) * 10000) / 100
+          : null
+      };
+    });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -1077,9 +1116,16 @@ export const saveRecipe = async (req, res, next) => {
     if (!['hotel_admin', 'super_admin'].includes(req.user?.role)) {
       return res.status(403).json({ success: false, message: 'Only hotel administrators can manage recipes.' });
     }
-    const { menuItemId, ingredients } = req.body;
+    const {
+      menuItemId, ingredients, recipeName = '', description = '',
+      servingSize = '1 serving', preparationTimeMinutes = 0
+    } = req.body;
     if (!mongoose.isValidObjectId(menuItemId) || !Array.isArray(ingredients) || !ingredients.length) {
       return res.status(400).json({ success: false, message: 'Menu item and at least one ingredient are required.' });
+    }
+    if (!Number.isFinite(Number(preparationTimeMinutes)) || Number(preparationTimeMinutes) < 0
+      || (typeof servingSize !== 'string' && typeof servingSize !== 'number')) {
+      return res.status(400).json({ success: false, message: 'Serving size and preparation time are invalid.' });
     }
     const MenuItem = mongoose.model('MenuItem');
     const menuItemExists = await MenuItem.exists({ _id: menuItemId, hotelId: req.hotelId });
@@ -1127,6 +1173,10 @@ export const saveRecipe = async (req, res, next) => {
       const [created] = await InventoryRecipe.create([{
         ...tenantFilter(req),
         menuItemId,
+        recipeName: String(recipeName).trim(),
+        description: String(description).trim(),
+        servingSize: String(servingSize).trim() || '1 serving',
+        preparationTimeMinutes: Number(preparationTimeMinutes),
         ingredients: ingredients.map((ingredient) => ({
           itemId: ingredient.itemId,
           quantity: Number(ingredient.quantity),
@@ -1141,7 +1191,56 @@ export const saveRecipe = async (req, res, next) => {
       }], { session });
       return created;
     });
+    await logAudit({
+      hotelId: req.hotelId,
+      action: 'SAVE_INVENTORY_RECIPE',
+      entity: 'InventoryRecipe',
+      entityId: recipe._id,
+      details: { menuItemId, version: recipe.version, recipeName: recipe.recipeName },
+      req
+    });
     res.status(201).json({ success: true, data: recipe });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const setRecipeStatus = async (req, res, next) => {
+  try {
+    if (!['hotel_admin', 'super_admin'].includes(req.user?.role)) {
+      return res.status(403).json({ success: false, message: 'Only hotel administrators can manage recipes.' });
+    }
+    if (typeof req.body.isActive !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'Recipe status must be active or inactive.' });
+    }
+    const recipe = await runInventoryTransaction(async (session) => {
+      const current = await InventoryRecipe.findOne({
+        _id: req.params.id,
+        ...tenantFilter(req)
+      }).session(session);
+      if (!current) return null;
+      if (req.body.isActive) {
+        await InventoryRecipe.updateMany({
+          ...tenantFilter(req),
+          menuItemId: current.menuItemId,
+          _id: { $ne: current._id },
+          isActive: true
+        }, { $set: { isActive: false } }, { session });
+      }
+      current.isActive = req.body.isActive;
+      await current.save({ session });
+      return current;
+    });
+    if (!recipe) return res.status(404).json({ success: false, message: 'Recipe not found.' });
+    await logAudit({
+      hotelId: req.hotelId,
+      action: req.body.isActive ? 'ACTIVATE_INVENTORY_RECIPE' : 'DEACTIVATE_INVENTORY_RECIPE',
+      entity: 'InventoryRecipe',
+      entityId: recipe._id,
+      details: { isActive: recipe.isActive, version: recipe.version },
+      req
+    });
+    res.json({ success: true, data: recipe });
   } catch (err) {
     next(err);
   }
@@ -1500,6 +1599,54 @@ export const getInventoryReport = async (req, res, next) => {
     if (type === 'recipe-consumption') {
       const filter = { ...scope, ...(createdAt ? { createdAt } : {}) };
       const data = await RecipeConsumption.find(filter).populate('ingredients.itemId', 'name code unit').sort({ createdAt: -1 }).lean();
+      return res.json({ success: true, data });
+    }
+    if (type === 'recipe-usage' || type === 'recipe-monthly-usage') {
+      const filter = {
+        ...scope,
+        status: 'deducted',
+        ...(createdAt ? { deductedAt: createdAt } : {}),
+        ...(itemId ? { 'ingredients.itemId': itemId } : {})
+      };
+      const consumptions = await RecipeConsumption.find(filter)
+        .populate('ingredients.itemId', 'name code unit baseUnit')
+        .sort({ deductedAt: -1 })
+        .limit(5010)
+        .lean();
+      const grouped = new Map();
+      const groupByMonth = type === 'recipe-monthly-usage';
+      for (const consumption of consumptions) {
+        const date = new Date(consumption.deductedAt).toISOString().slice(0, 10);
+        for (const ingredient of consumption.ingredients) {
+          const item = ingredient.itemId;
+          if (!item || (itemId && String(item._id) !== String(itemId))) continue;
+          const period = groupByMonth ? date.slice(0, 7) : date;
+          const key = `${period}:${item._id}:${ingredient.menuItemId}`;
+          const entry = grouped.get(key) || {
+            ...(groupByMonth ? {} : { date }),
+            month: date.slice(0, 7),
+            itemId: String(item._id),
+            itemName: item.name,
+            code: item.code,
+            unit: ingredient.baseUnit || item.baseUnit || item.unit,
+            menuItemId: String(ingredient.menuItemId),
+            menuItemName: ingredient.menuItemName,
+            quantity: 0,
+            totalCost: 0,
+            orderIds: new Set()
+          };
+          entry.quantity += ingredient.quantity;
+          entry.totalCost += ingredient.totalCost;
+          entry.orderIds.add(String(consumption.orderId));
+          grouped.set(key, entry);
+        }
+      }
+      const data = [...grouped.values()].map(({ orderIds, ...entry }) => ({
+        ...entry,
+        quantity: Math.round(entry.quantity * 100000000) / 100000000,
+        totalCost: Math.round(entry.totalCost * 100) / 100,
+        orderCount: orderIds.size
+      }));
       return res.json({ success: true, data });
     }
     if (type === 'verifications') {

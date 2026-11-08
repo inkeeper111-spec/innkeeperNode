@@ -27,10 +27,6 @@ const stockVerificationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 stockVerificationSchema.index(
-  { hotelId: 1, propertyId: 1, itemId: 1, location: 1, periodEnd: 1 },
-  { unique: true }
-);
-stockVerificationSchema.index(
   { hotelId: 1, propertyId: 1, idempotencyKey: 1 },
   { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
 );

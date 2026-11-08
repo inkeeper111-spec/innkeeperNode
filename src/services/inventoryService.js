@@ -213,6 +213,15 @@ export const postStockMovement = async ({
     batchesToDeduct = await InventoryBatch.find(batchFilter)
       .sort({ receivedAt: 1, _id: 1 })
       .session(session);
+    if (movementType === 'recipe_consumption' && (item.trackExpiry || hasExpiryBatches)) {
+      batchesToDeduct.sort((left, right) => {
+        const leftExpiry = left.expiryDate ? new Date(left.expiryDate).getTime() : Number.POSITIVE_INFINITY;
+        const rightExpiry = right.expiryDate ? new Date(right.expiryDate).getTime() : Number.POSITIVE_INFINITY;
+        return leftExpiry - rightExpiry
+          || new Date(left.receivedAt).getTime() - new Date(right.receivedAt).getTime()
+          || String(left._id).localeCompare(String(right._id));
+      });
+    }
     const usableQuantity = batchesToDeduct.reduce((sum, batch) => sum + batch.remainingQuantity, 0);
     if ((item.trackExpiry || item.trackBatchNumber || hasExpiryBatches || movementType === 'expiry')
       && usableQuantity < Math.abs(delta)) {
@@ -443,7 +452,10 @@ export const transferStock = async ({
   return { movements, item, duplicate: false };
 };
 
-export const consumeRecipesForOrder = async (order, session) => {
+export const consumeRecipesForOrder = async (order, session, {
+  skipEmpty = false,
+  recordedBy = order.createdBy
+} = {}) => {
   const existing = await RecipeConsumption.findOne({
     hotelId: order.hotelId, propertyId: order.propertyId, orderId: order._id
   }).session(session);
@@ -510,6 +522,8 @@ export const consumeRecipesForOrder = async (order, session) => {
     }
   }
 
+  if (!required.size && skipEmpty) return null;
+
   const entries = [];
   for (const requirement of required.values()) {
     const movementResult = await postStockMovement({
@@ -522,7 +536,7 @@ export const consumeRecipesForOrder = async (order, session) => {
       department: 'Restaurant',
       referenceNumber: order.orderNumber,
       notes: `Recipe consumption for finalized restaurant order ${order.orderNumber}`,
-      recordedBy: order.createdBy,
+      recordedBy,
       orderId: order._id,
       idempotencyKey: `recipe-sale:${order._id}:${requirement.item._id}`,
       metadata: { recipeSources: requirement.sources },
@@ -559,4 +573,108 @@ export const consumeRecipesForOrder = async (order, session) => {
     ingredients: entries,
     totalCost: round(entries.reduce((sum, entry) => sum + entry.totalCost, 0))
   }], { session }).then(([created]) => created);
+};
+
+export const reverseRecipeConsumptionForOrder = async (order, session, recordedBy) => {
+  const consumption = await RecipeConsumption.findOne({
+    hotelId: order.hotelId,
+    propertyId: order.propertyId,
+    orderId: order._id
+  }).session(session);
+  if (!consumption || consumption.status === 'reversed') return consumption;
+
+  const movements = await StockMovement.find({
+    hotelId: order.hotelId,
+    propertyId: order.propertyId,
+    orderId: order._id,
+    movementType: 'recipe_consumption'
+  }).session(session);
+
+  for (const movement of movements) {
+    const item = await InventoryItem.findOneAndUpdate(
+      { _id: movement.itemId, hotelId: order.hotelId, propertyId: order.propertyId },
+      { $inc: { currentStock: movement.quantity } },
+      { new: true, session }
+    );
+    if (!item) {
+      throw Object.assign(new Error('A recipe ingredient could not be restored because its inventory item is missing.'), { statusCode: 409 });
+    }
+
+    const balance = await updateBalance({
+      hotelId: order.hotelId,
+      propertyId: order.propertyId,
+      item,
+      location: movement.location,
+      delta: movement.quantity,
+      session
+    });
+
+    const restoredAllocations = [];
+    for (const allocation of movement.batchAllocations || []) {
+      if (!allocation.batchId) {
+        restoredAllocations.push({
+          batchId: null,
+          quantity: allocation.quantity,
+          unitCost: allocation.unitCost,
+          totalCost: allocation.totalCost,
+          source: allocation.source
+        });
+        continue;
+      }
+      const restoredBatch = await InventoryBatch.findOneAndUpdate({
+        _id: allocation.batchId,
+        hotelId: order.hotelId,
+        propertyId: order.propertyId,
+        itemId: movement.itemId,
+        location: movement.location,
+        $expr: {
+          $lte: [
+            { $add: ['$remainingQuantity', allocation.quantity] },
+            '$quantity'
+          ]
+        }
+      }, { $inc: { remainingQuantity: allocation.quantity } }, { new: true, session });
+      if (!restoredBatch) {
+        throw Object.assign(new Error('A consumed inventory batch could not be restored safely.'), { statusCode: 409 });
+      }
+      restoredAllocations.push({
+        batchId: allocation.batchId,
+        quantity: allocation.quantity,
+        unitCost: allocation.unitCost,
+        totalCost: allocation.totalCost,
+        source: allocation.source
+      });
+    }
+
+    const previousStock = roundQuantity(item.currentStock - movement.quantity);
+    await StockMovement.create([{
+      hotelId: order.hotelId,
+      propertyId: order.propertyId,
+      itemId: movement.itemId,
+      movementType: 'sale_reversal',
+      quantity: movement.quantity,
+      previousStock,
+      newStock: item.currentStock,
+      unitCost: movement.unitCost,
+      totalValue: movement.totalValue,
+      referenceNumber: order.orderNumber,
+      notes: `Recipe consumption reversal for cancelled restaurant order ${order.orderNumber}`,
+      recordedBy,
+      location: movement.location,
+      department: movement.department,
+      orderId: order._id,
+      idempotencyKey: `recipe-sale-reversal:${order._id}:${movement.itemId}`,
+      batchAllocations: restoredAllocations,
+      metadata: {
+        reversedMovementId: movement._id,
+        locationPreviousStock: balance.previous,
+        locationNewStock: balance.current
+      }
+    }], { session });
+  }
+
+  consumption.status = 'reversed';
+  consumption.reversedAt = new Date();
+  await consumption.save({ session });
+  return consumption;
 };

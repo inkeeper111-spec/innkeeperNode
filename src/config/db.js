@@ -4,6 +4,29 @@ import { logger } from './logger.js';
 
 let memoryServer = null;
 
+const dropUniqueStockVerificationDateIndex = async () => {
+  const collectionName = 'stockverifications';
+  const database = mongoose.connection.db;
+  const collectionExists = await database.listCollections({ name: collectionName }).hasNext();
+  if (!collectionExists) return;
+
+  const collection = database.collection(collectionName);
+  const indexes = await collection.indexes();
+  const uniqueDateIndex = indexes.find((index) => (
+    index.unique
+    && index.key?.hotelId === 1
+    && index.key?.propertyId === 1
+    && index.key?.itemId === 1
+    && index.key?.location === 1
+    && index.key?.periodEnd === 1
+    && Object.keys(index.key).length === 5
+  ));
+  if (uniqueDateIndex) {
+    await collection.dropIndex(uniqueDateIndex.name);
+    logger.info('Removed unique stock verification date index to allow multiple same-day counts.');
+  }
+};
+
 export const connectDB = async () => {
   const uri = process.env.MONGODB_URI || '';
 
@@ -19,6 +42,7 @@ export const connectDB = async () => {
           serverSelectionTimeoutMS: 15010,
           connectTimeoutMS: 15010
         });
+        await dropUniqueStockVerificationDateIndex();
         logger.info(`MongoDB connected: ${uri.replace(/\/\/.*@/, '//***@')}`);
         return;
       } catch (err) {
@@ -40,6 +64,7 @@ export const connectDB = async () => {
       instanceOpts: [{ storageEngine: 'wiredTiger' }]
     });
     await mongoose.connect(memoryServer.getUri());
+    await dropUniqueStockVerificationDateIndex();
     logger.info(`Connected to in-memory MongoDB: ${memoryServer.getUri()}`);
     logger.warn('In-memory database is ephemeral. Set a reachable MONGODB_URI to persist data.');
   } catch (memErr) {

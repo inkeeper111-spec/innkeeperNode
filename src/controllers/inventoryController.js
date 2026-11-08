@@ -234,11 +234,17 @@ export const getInventoryBatches = async (req, res, next) => {
       hotelId: req.hotelId,
       propertyId: req.propertyId,
       itemId: item._id
-    }).select('location actualStock verifiedAt').sort({ verifiedAt: -1 }).lean();
+    }).select('location actualStock verifiedAt discrepancyQuantity stockGain movementIds').sort({ verifiedAt: -1 }).lean();
     const latestVerificationByLocation = new Map();
+    const profitableVerificationByMovement = new Map();
     for (const verification of verifications) {
       if (!latestVerificationByLocation.has(verification.location || 'Main Store')) {
         latestVerificationByLocation.set(verification.location || 'Main Store', Number(verification.actualStock) || 0);
+      }
+      if (Number(verification.discrepancyQuantity) > 0) {
+        for (const movementId of verification.movementIds || []) {
+          profitableVerificationByMovement.set(String(movementId), Number(verification.discrepancyQuantity));
+        }
       }
     }
     const movements = await StockMovement.find({
@@ -247,8 +253,18 @@ export const getInventoryBatches = async (req, res, next) => {
       itemId: item._id,
       ...(req.query.location ? { location: String(req.query.location).trim() } : {})
     }).select('movementType batchAllocations orderId metadata quantity location destinationLocation transactionDate createdAt').sort({ transactionDate: 1, createdAt: 1, _id: 1 }).lean();
+    const balances = await InventoryBalance.find({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      ...(req.query.location ? { location: String(req.query.location).trim() } : {})
+    }).select('location quantity').lean();
+    const currentBalanceByLocation = new Map(
+      balances.map((balance) => [balance.location || 'Main Store', Number(balance.quantity) || 0])
+    );
     const batchStats = new Map(batches.map((batch) => [String(batch._id), {
       consumedQuantity: 0,
+      consumedProfitablyQuantity: 0,
       wastageQuantity: 0,
       unrecordedQuantity: 0,
       salesCost: 0,
@@ -258,36 +274,57 @@ export const getInventoryBatches = async (req, res, next) => {
       transferredQuantity: 0
     }]));
     const remainingByBatch = new Map(batches.map((batch) => [String(batch._id), Number(batch.quantity) || 0]));
-    const recipeSalesByOrder = new Map();
+    const movementById = new Map(movements.map((movement) => [String(movement._id), movement]));
     for (const movement of movements) {
       const allocations = movement.batchAllocations || [];
       const allocatedQuantity = allocations.reduce((sum, allocation) => sum + (Number(allocation.quantity) || 0), 0);
+      const profitableVerificationQuantity = profitableVerificationByMovement.get(String(movement._id)) || 0;
+      let profitableQuantityRemaining = profitableVerificationQuantity;
+      if (movement.movementType === 'sale_reversal') {
+        const reversedMovement = movementById.get(String(movement.metadata?.reversedMovementId || ''));
+        if (reversedMovement?.movementType === 'recipe_consumption') {
+          for (const allocation of allocations) {
+            const batchId = String(allocation.batchId || '');
+            const stats = batchStats.get(batchId);
+            if (!stats) continue;
+            const quantity = Number(allocation.quantity) || 0;
+            stats.consumedProfitablyQuantity = Math.max(0, stats.consumedProfitablyQuantity - quantity);
+            stats.salesRevenue = Math.max(0, stats.salesRevenue - (Number(allocation.totalCost) || quantity * (Number(allocation.unitCost) || 0)));
+            remainingByBatch.set(
+              batchId,
+              Math.min(
+                Number(batches.find((batch) => String(batch._id) === batchId)?.quantity) || 0,
+                (remainingByBatch.get(batchId) || 0) + quantity
+              )
+            );
+          }
+        }
+        continue;
+      }
       const registerAllocation = (batchId, quantity, unitCost, movementType) => {
         const stats = batchStats.get(batchId);
         if (!stats || quantity <= 0) return;
         const cost = quantity * unitCost;
-        if (['issue', 'department_issue', 'recipe_consumption'].includes(movement.movementType)) {
+        if (movement.movementType === 'recipe_consumption') {
+          stats.consumedProfitablyQuantity += quantity;
+          stats.salesRevenue += cost;
+        } else if (['issue', 'department_issue'].includes(movement.movementType)) {
           stats.consumedQuantity += quantity;
         } else if (['wastage', 'expiry'].includes(movementType)) {
           stats.wastageQuantity += quantity;
           stats.wastageLoss += cost;
         } else if (['physical_count', 'adjustment'].includes(movementType)) {
-          stats.unrecordedQuantity += quantity;
-          stats.unrecordedLoss += cost;
+          const profitableQuantity = movementType === 'physical_count'
+            ? Math.min(quantity, profitableQuantityRemaining)
+            : 0;
+          profitableQuantityRemaining -= profitableQuantity;
+          stats.consumedProfitablyQuantity += profitableQuantity;
+          stats.salesRevenue += profitableQuantity * unitCost;
+          const unrecordedQuantity = quantity - profitableQuantity;
+          stats.unrecordedQuantity += unrecordedQuantity;
+          stats.unrecordedLoss += unrecordedQuantity * unitCost;
         } else if (movementType === 'transfer') {
           stats.transferredQuantity += quantity;
-        }
-        if (movement.movementType === 'recipe_consumption' && movement.orderId) {
-          const orderKey = String(movement.orderId);
-          const orderStats = recipeSalesByOrder.get(orderKey) || { batchCosts: new Map(), menuItemIds: new Set() };
-          orderStats.batchCosts.set(
-            batchId,
-            (orderStats.batchCosts.get(batchId) || 0) + cost
-          );
-          for (const source of movement.metadata?.recipeSources || []) {
-            if (source.menuItemId) orderStats.menuItemIds.add(String(source.menuItemId));
-          }
-          recipeSalesByOrder.set(orderKey, orderStats);
         }
         remainingByBatch.set(batchId, Math.max(0, (remainingByBatch.get(batchId) || 0) - quantity));
       };
@@ -330,39 +367,6 @@ export const getInventoryBatches = async (req, res, next) => {
         }
       }
     }
-    const orderIds = [...recipeSalesByOrder.keys()];
-    const orders = orderIds.length
-      ? await FoodOrder.find({
-        hotelId: req.hotelId,
-        propertyId: req.propertyId,
-        _id: { $in: orderIds },
-        status: 'served',
-        paymentStatus: { $in: ['paid', 'transferred_to_folio'] }
-      }).select('items subtotal discountAmount').lean()
-      : [];
-    for (const order of orders) {
-      const orderStats = recipeSalesByOrder.get(String(order._id));
-      const lines = (order.items || []).filter((line) => (
-        !orderStats.menuItemIds.size || orderStats.menuItemIds.has(String(line.menuItemId))
-      ));
-      const orderSubtotal = Number(order.subtotal) || 0;
-      const discount = Number(order.discountAmount) || 0;
-      const salesRevenue = lines.reduce((sum, line) => {
-        const lineAmount = Number(line.amount ?? Number(line.quantity || 0) * Number(line.unitPrice || 0));
-        const discountShare = orderSubtotal > 0 ? discount * lineAmount / orderSubtotal : 0;
-        return sum + Math.max(0, lineAmount - discountShare);
-      }, 0);
-      const batchCostTotal = [...orderStats.batchCosts.values()]
-        .reduce((sum, cost) => sum + cost, 0);
-      if (batchCostTotal <= 0) continue;
-      for (const [batchId, cost] of orderStats.batchCosts) {
-        const stats = batchStats.get(batchId);
-        if (stats) {
-          stats.salesRevenue += salesRevenue * cost / batchCostTotal;
-          stats.salesCost += cost;
-        }
-      }
-    }
     const batchIdsByLocation = new Map();
     for (const batch of batches) {
       const location = batch.location || 'Main Store';
@@ -372,20 +376,22 @@ export const getInventoryBatches = async (req, res, next) => {
     }
     const actualUsableByBatch = new Map();
     for (const [location, batchIds] of batchIdsByLocation) {
-      const verifiedStock = latestVerificationByLocation.get(location);
-      if (verifiedStock === undefined) continue;
-      let remainingVerifiedStock = verifiedStock;
+      const currentStock = currentBalanceByLocation.has(location)
+        ? currentBalanceByLocation.get(location)
+        : latestVerificationByLocation.get(location);
+      if (currentStock === undefined) continue;
+      let remainingStock = currentStock;
       for (const batchId of batchIds) {
         const batchRemaining = remainingByBatch.get(batchId) || 0;
-        const actualUsable = Math.min(batchRemaining, remainingVerifiedStock);
+        const actualUsable = Math.min(batchRemaining, remainingStock);
         actualUsableByBatch.set(batchId, actualUsable);
-        remainingVerifiedStock = Math.max(0, remainingVerifiedStock - actualUsable);
+        remainingStock = Math.max(0, remainingStock - actualUsable);
       }
-      if (remainingVerifiedStock > 0 && batchIds.length) {
+      if (remainingStock > 0 && batchIds.length) {
         const lastBatchId = batchIds[batchIds.length - 1];
         actualUsableByBatch.set(
           lastBatchId,
-          (actualUsableByBatch.get(lastBatchId) || 0) + remainingVerifiedStock
+          (actualUsableByBatch.get(lastBatchId) || 0) + remainingStock
         );
       }
     }
@@ -404,14 +410,13 @@ export const getInventoryBatches = async (req, res, next) => {
           actualUsableStock: actualUsableByBatch.get(String(batch._id))
             ?? remainingByBatch.get(String(batch._id)) ?? 0,
           unrecordedConsumptionQuantity: stats.consumedQuantity,
-          consumedProfitablyQuantity: stats.unrecordedQuantity,
+          consumedProfitablyQuantity: stats.consumedProfitablyQuantity,
           uploadedQuantity: Number(batch.quantity) || 0,
           consumedQuantity: stats.consumedQuantity,
           wastageQuantity: stats.wastageQuantity,
           unrecordedQuantity: stats.unrecordedQuantity,
           remainingQuantity: remainingByBatch.get(String(batch._id)) || 0,
           salesRevenue,
-          profit: salesRevenue - stats.salesCost,
           loss: wastageLoss + unrecordedLoss,
           wastageLoss,
           unrecordedLoss

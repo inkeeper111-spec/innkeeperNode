@@ -1,11 +1,15 @@
-import { MenuCategory, MenuItem, FoodOrder, Reservation, Invoice, Room, RestaurantTable, Property } from '../models/index.js';
+import {
+  MenuCategory, MenuItem, FoodOrder, Reservation, Invoice, Room, RestaurantTable, Property, InventorySettings
+} from '../models/index.js';
 import { FOOD_ORDER_STATUS, RESERVATION_STATUS } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
 import { formatCurrency } from '../utils/currency.js';
 import mongoose from 'mongoose';
 import { notifyRoles } from '../services/notificationService.js';
-import { consumeRecipesForOrder, runInventoryTransaction } from '../services/inventoryService.js';
+import {
+  consumeRecipesForOrder, reverseRecipeConsumptionForOrder, runInventoryTransaction
+} from '../services/inventoryService.js';
 
 const resolveRestaurantProperty = async (req, res) => {
   const propertyId = req.propertyId || req.user.propertyId
@@ -623,28 +627,37 @@ export const updateOrderStatus = async (req, res, next) => {
       [FOOD_ORDER_STATUS.SERVED]: [],
       [FOOD_ORDER_STATUS.CANCELLED]: []
     };
-    const order = await FoodOrder.findOne({
-      _id: req.params.id,
-      hotelId: req.hotelId,
-      propertyId
+    const updated = await runInventoryTransaction(async (session) => {
+      const order = await FoodOrder.findOne({
+        _id: req.params.id,
+        hotelId: req.hotelId,
+        propertyId
+      }).session(session);
+      if (!order) {
+        throw Object.assign(new Error('Order not found.'), { statusCode: 404 });
+      }
+      if (!transitions[order.status]?.includes(status)) {
+        throw Object.assign(new Error(`Order cannot transition from ${order.status} to ${status}.`), { statusCode: 400 });
+      }
+
+      const settings = await InventorySettings.findOne({
+        hotelId: req.hotelId,
+        propertyId
+      }).session(session);
+      const deductionStatus = (settings?.recipeDeductionStage || 'prepared') === 'served'
+        ? FOOD_ORDER_STATUS.SERVED
+        : FOOD_ORDER_STATUS.READY;
+      if (status === deductionStatus) {
+        await consumeRecipesForOrder(order, session, { skipEmpty: true, recordedBy: req.user._id });
+      }
+      if (status === FOOD_ORDER_STATUS.CANCELLED) {
+        await reverseRecipeConsumptionForOrder(order, session, req.user._id);
+      }
+
+      order.status = status;
+      await order.save({ session });
+      return order;
     });
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found.' });
-    }
-    if (!transitions[order.status]?.includes(status)) {
-      return res.status(400).json({ success: false, message: `Order cannot transition from ${order.status} to ${status}.` });
-    }
-
-    const updated = await FoodOrder.findOneAndUpdate({
-      _id: order._id,
-      hotelId: req.hotelId,
-      propertyId,
-      status: order.status
-    }, { $set: { status } }, { new: true });
-    if (!updated) {
-      return res.status(409).json({ success: false, message: 'Order was updated concurrently. Refresh and try again.' });
-    }
 
     if (updated.tableId && (status === FOOD_ORDER_STATUS.CANCELLED
       || (status === FOOD_ORDER_STATUS.SERVED && ['paid', 'transferred_to_folio'].includes(updated.paymentStatus)))) {
