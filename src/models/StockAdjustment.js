@@ -15,7 +15,7 @@ const stockAdjustmentSchema = new mongoose.Schema({
   },
   department: { type: String, trim: true, default: '' },
   location: { type: String, trim: true, default: 'Main Store' },
-  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true },
+  status: { type: String, enum: ['pending', 'logged', 'approved', 'rejected'], default: 'approved', index: true },
   reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   approvedAt: Date,

@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import {
   DepartmentRequest, GoodsReceipt, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, StockReceiptRequest, Unit,
-  MinibarStock, MinibarTransaction, StockMovement, StockVerification, SupplierPayment, Vendor, PurchaseOrder
+  FoodOrder, MinibarStock, MinibarTransaction, StockMovement, StockVerification, SupplierPayment, Vendor, PurchaseOrder
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
@@ -217,7 +217,7 @@ export const getInventoryBatches = async (req, res, next) => {
       _id: itemId,
       hotelId: req.hotelId,
       propertyId: req.propertyId
-    }).select('_id currentStock unitCost location baseUnit unit');
+    }).select('_id name location baseUnit unit');
     if (!item) {
       return res.status(404).json({ success: false, message: 'Inventory item not found.' });
     }
@@ -230,57 +230,193 @@ export const getInventoryBatches = async (req, res, next) => {
       .populate('vendorId', 'name')
       .sort({ receivedAt: 1, _id: 1 })
       .lean();
-    const balances = await InventoryBalance.find({
+    const verifications = await StockVerification.find({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id
+    }).select('location actualStock verifiedAt').sort({ verifiedAt: -1 }).lean();
+    const latestVerificationByLocation = new Map();
+    for (const verification of verifications) {
+      if (!latestVerificationByLocation.has(verification.location || 'Main Store')) {
+        latestVerificationByLocation.set(verification.location || 'Main Store', Number(verification.actualStock) || 0);
+      }
+    }
+    const movements = await StockMovement.find({
       hotelId: req.hotelId,
       propertyId: req.propertyId,
       itemId: item._id,
       ...(req.query.location ? { location: String(req.query.location).trim() } : {})
-    }).select('location quantity').lean();
-    const batchQuantityByLocation = new Map();
+    }).select('movementType batchAllocations orderId metadata quantity location destinationLocation transactionDate createdAt').sort({ transactionDate: 1, createdAt: 1, _id: 1 }).lean();
+    const batchStats = new Map(batches.map((batch) => [String(batch._id), {
+      consumedQuantity: 0,
+      wastageQuantity: 0,
+      unrecordedQuantity: 0,
+      salesCost: 0,
+      wastageLoss: 0,
+      unrecordedLoss: 0,
+      salesRevenue: 0,
+      transferredQuantity: 0
+    }]));
+    const remainingByBatch = new Map(batches.map((batch) => [String(batch._id), Number(batch.quantity) || 0]));
+    const recipeSalesByOrder = new Map();
+    for (const movement of movements) {
+      const allocations = movement.batchAllocations || [];
+      const allocatedQuantity = allocations.reduce((sum, allocation) => sum + (Number(allocation.quantity) || 0), 0);
+      const registerAllocation = (batchId, quantity, unitCost, movementType) => {
+        const stats = batchStats.get(batchId);
+        if (!stats || quantity <= 0) return;
+        const cost = quantity * unitCost;
+        if (['issue', 'department_issue', 'recipe_consumption'].includes(movement.movementType)) {
+          stats.consumedQuantity += quantity;
+        } else if (['wastage', 'expiry'].includes(movementType)) {
+          stats.wastageQuantity += quantity;
+          stats.wastageLoss += cost;
+        } else if (['physical_count', 'adjustment'].includes(movementType)) {
+          stats.unrecordedQuantity += quantity;
+          stats.unrecordedLoss += cost;
+        } else if (movementType === 'transfer') {
+          stats.transferredQuantity += quantity;
+        }
+        if (movement.movementType === 'recipe_consumption' && movement.orderId) {
+          const orderKey = String(movement.orderId);
+          const orderStats = recipeSalesByOrder.get(orderKey) || { batchCosts: new Map(), menuItemIds: new Set() };
+          orderStats.batchCosts.set(
+            batchId,
+            (orderStats.batchCosts.get(batchId) || 0) + cost
+          );
+          for (const source of movement.metadata?.recipeSources || []) {
+            if (source.menuItemId) orderStats.menuItemIds.add(String(source.menuItemId));
+          }
+          recipeSalesByOrder.set(orderKey, orderStats);
+        }
+        remainingByBatch.set(batchId, Math.max(0, (remainingByBatch.get(batchId) || 0) - quantity));
+      };
+      const isTransferOut = movement.movementType === 'transfer'
+        && movement.metadata?.fromLocation === movement.location
+        && movement.metadata?.toLocation !== movement.location;
+      const movementType = isTransferOut ? 'transfer' : movement.movementType;
+      const tracksReduction = [
+        'issue', 'department_issue', 'recipe_consumption', 'wastage',
+        'expiry', 'physical_count', 'adjustment'
+      ].includes(movementType) || isTransferOut;
+      if (!tracksReduction) continue;
+
+      let pendingQuantity = 0;
+      for (const allocation of allocations) {
+        if (!allocation.batchId || !batchStats.has(String(allocation.batchId))) {
+          pendingQuantity += Number(allocation.quantity) || 0;
+          continue;
+        }
+        registerAllocation(
+          String(allocation.batchId),
+          Number(allocation.quantity) || 0,
+          Number(allocation.unitCost) || 0,
+          movementType
+        );
+      }
+      pendingQuantity += Math.max(0, (Number(movement.quantity) || 0) - allocatedQuantity);
+      if (pendingQuantity > 0) {
+        const exactLocationBatches = batches.filter((batch) => batch.location === movement.location);
+        const candidateBatches = exactLocationBatches.length ? exactLocationBatches : batches;
+        let leftToAllocate = pendingQuantity;
+        for (const batch of candidateBatches) {
+          if (leftToAllocate <= 0) break;
+          const batchId = String(batch._id);
+          const available = remainingByBatch.get(batchId) || 0;
+          const quantity = Math.min(available, leftToAllocate);
+          if (quantity <= 0) continue;
+          registerAllocation(batchId, quantity, Number(batch.unitCost) || 0, movementType);
+          leftToAllocate -= quantity;
+        }
+      }
+    }
+    const orderIds = [...recipeSalesByOrder.keys()];
+    const orders = orderIds.length
+      ? await FoodOrder.find({
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        _id: { $in: orderIds },
+        status: 'served',
+        paymentStatus: { $in: ['paid', 'transferred_to_folio'] }
+      }).select('items subtotal discountAmount').lean()
+      : [];
+    for (const order of orders) {
+      const orderStats = recipeSalesByOrder.get(String(order._id));
+      const lines = (order.items || []).filter((line) => (
+        !orderStats.menuItemIds.size || orderStats.menuItemIds.has(String(line.menuItemId))
+      ));
+      const orderSubtotal = Number(order.subtotal) || 0;
+      const discount = Number(order.discountAmount) || 0;
+      const salesRevenue = lines.reduce((sum, line) => {
+        const lineAmount = Number(line.amount ?? Number(line.quantity || 0) * Number(line.unitPrice || 0));
+        const discountShare = orderSubtotal > 0 ? discount * lineAmount / orderSubtotal : 0;
+        return sum + Math.max(0, lineAmount - discountShare);
+      }, 0);
+      const batchCostTotal = [...orderStats.batchCosts.values()]
+        .reduce((sum, cost) => sum + cost, 0);
+      if (batchCostTotal <= 0) continue;
+      for (const [batchId, cost] of orderStats.batchCosts) {
+        const stats = batchStats.get(batchId);
+        if (stats) {
+          stats.salesRevenue += salesRevenue * cost / batchCostTotal;
+          stats.salesCost += cost;
+        }
+      }
+    }
+    const batchIdsByLocation = new Map();
     for (const batch of batches) {
       const location = batch.location || 'Main Store';
-      batchQuantityByLocation.set(
-        location,
-        (batchQuantityByLocation.get(location) || 0) + (Number(batch.remainingQuantity) || 0)
-      );
+      const locationBatchIds = batchIdsByLocation.get(location) || [];
+      locationBatchIds.push(String(batch._id));
+      batchIdsByLocation.set(location, locationBatchIds);
     }
-    const stockByLocation = balances.length
-      ? balances
-      : [{
-        location: String(req.query.location || item.location || 'Main Store').trim(),
-        quantity: item.currentStock
-      }];
-    const legacyBatches = stockByLocation.flatMap((balance) => {
-      const location = balance.location || 'Main Store';
-      const untrackedQuantity = Math.max(
-        0,
-        (Number(balance.quantity) || 0) - (batchQuantityByLocation.get(location) || 0)
-      );
-      if (untrackedQuantity <= 1e-8) return [];
-      return [{
-        _id: `legacy-${item._id}-${encodeURIComponent(location)}`,
-        itemId: item._id,
-        location,
-        batchNumber: 'Untracked stock',
-        quantity: untrackedQuantity,
-        remainingQuantity: untrackedQuantity,
-        unitCost: item.unitCost,
-        purchaseQuantity: null,
-        purchaseUnit: '',
-        purchaseUnitCost: null,
-        purchaseAmount: null,
-        vendorId: null,
-        receivedAt: null,
-        legacyStock: true,
-        status: 'untracked'
-      }];
-    });
+    const actualUsableByBatch = new Map();
+    for (const [location, batchIds] of batchIdsByLocation) {
+      const verifiedStock = latestVerificationByLocation.get(location);
+      if (verifiedStock === undefined) continue;
+      let remainingVerifiedStock = verifiedStock;
+      for (const batchId of batchIds) {
+        const batchRemaining = remainingByBatch.get(batchId) || 0;
+        const actualUsable = Math.min(batchRemaining, remainingVerifiedStock);
+        actualUsableByBatch.set(batchId, actualUsable);
+        remainingVerifiedStock = Math.max(0, remainingVerifiedStock - actualUsable);
+      }
+      if (remainingVerifiedStock > 0 && batchIds.length) {
+        const lastBatchId = batchIds[batchIds.length - 1];
+        actualUsableByBatch.set(
+          lastBatchId,
+          (actualUsableByBatch.get(lastBatchId) || 0) + remainingVerifiedStock
+        );
+      }
+    }
     res.json({
       success: true,
-      data: [...batches.map((batch) => ({
-        ...batch,
-        status: batch.remainingQuantity > 0 ? 'open' : 'closed'
-      })), ...legacyBatches]
+      data: batches.map((batch) => {
+        const stats = batchStats.get(String(batch._id));
+        const salesRevenue = stats.salesRevenue;
+        const wastageLoss = stats.wastageLoss;
+        const unrecordedLoss = stats.unrecordedLoss;
+        return {
+          ...batch,
+          status: (remainingByBatch.get(String(batch._id)) || 0) > 0 ? 'open' : 'closed',
+          materialName: item.name,
+          expectedStock: Number(batch.quantity) || 0,
+          actualUsableStock: actualUsableByBatch.get(String(batch._id))
+            ?? remainingByBatch.get(String(batch._id)) ?? 0,
+          unrecordedConsumptionQuantity: stats.consumedQuantity,
+          consumedProfitablyQuantity: stats.unrecordedQuantity,
+          uploadedQuantity: Number(batch.quantity) || 0,
+          consumedQuantity: stats.consumedQuantity,
+          wastageQuantity: stats.wastageQuantity,
+          unrecordedQuantity: stats.unrecordedQuantity,
+          remainingQuantity: remainingByBatch.get(String(batch._id)) || 0,
+          salesRevenue,
+          profit: salesRevenue - stats.salesCost,
+          loss: wastageLoss + unrecordedLoss,
+          wastageLoss,
+          unrecordedLoss
+        };
+      })
     });
   } catch (error) {
     next(error);

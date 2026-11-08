@@ -11,7 +11,7 @@ import { convertQuantityToBase, getUnitConversionFactor, normalizeInventoryUnit 
 
 const adminOnly = (req, res) => {
   if (['hotel_admin', 'super_admin'].includes(req.user?.role)) return true;
-  res.status(403).json({ success: false, message: 'Hotel administrator approval is required.' });
+  res.status(403).json({ success: false, message: 'Hotel administrator access is required.' });
   return false;
 };
 
@@ -216,11 +216,12 @@ export const getStockVerifications = async (req, res, next) => {
 
 export const createStockVerification = async (req, res, next) => {
   try {
+    if (!adminOnly(req, res)) return;
     const {
       itemId, actualStock, unit, periodStart, periodEnd, location = 'Main Store',
       consumptionQuantity = 0, consumptionUnit, consumptionReason = '',
       wastageQuantity = 0, wastageUnit, wastageReason = '',
-      discrepancyReason = '', remarks = ''
+      remarks = ''
     } = req.body;
     if (!mongoose.isValidObjectId(itemId) || !String(location).trim()) {
       return res.status(400).json({ success: false, message: 'Select a valid raw material and stock location.' });
@@ -287,9 +288,7 @@ export const createStockVerification = async (req, res, next) => {
         Math.round((reduction - convertedConsumption.quantity - convertedWastage.quantity + Number.EPSILON) * 1e8) / 1e8
       );
       const stockGain = Math.max(0, delta);
-      if ((discrepancyQuantity > 0 || stockGain > 0) && !String(discrepancyReason).trim()) {
-        throw Object.assign(new Error('A reason is required for stock discrepancies or gains.'), { statusCode: 400 });
-      }
+      const discrepancyLabel = discrepancyQuantity > 0 ? 'Profitably consumed' : stockGain > 0 ? 'Stock gain' : '';
       const duplicatePeriod = await StockVerification.exists({
         ...tenantFilter(req),
         itemId: item._id,
@@ -314,9 +313,9 @@ export const createStockVerification = async (req, res, next) => {
         discrepancyQuantity,
         stockGain,
         unit: item.baseUnit || item.unit,
-        discrepancyReason: String(discrepancyReason).trim(),
+        discrepancyReason: discrepancyLabel,
         remarks: String(remarks).trim(),
-        status: discrepancyQuantity > 0 || stockGain > 0 ? 'pending' : 'verified',
+        status: 'approved',
         verifiedBy: req.user._id,
         idempotencyKey: idempotencyKey || undefined
       }], { session });
@@ -350,6 +349,20 @@ export const createStockVerification = async (req, res, next) => {
         movements.push(movement.movement._id);
       }
       if (discrepancyQuantity > 0 || stockGain > 0) {
+        const movementResult = await postStockMovement({
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          itemId: item._id,
+          movementType: 'physical_count',
+          quantity: convertedActual.quantity,
+          unit: item.baseUnit || item.unit,
+          location: String(location).trim(),
+          referenceNumber: `VER-${verification._id}`,
+          notes: [discrepancyLabel, String(remarks).trim()].filter(Boolean).join('. '),
+          recordedBy: req.user._id,
+          idempotencyKey: `verification:${verification._id}:physical-count`,
+          session
+        });
         const [adjustment] = await StockAdjustment.create([{
           ...tenantFilter(req),
           itemId: item._id,
@@ -359,11 +372,13 @@ export const createStockVerification = async (req, res, next) => {
           baseUnit: item.baseUnit || item.unit,
           reason: 'physical_mismatch',
           location: String(location).trim(),
-          status: 'pending',
+          status: 'approved',
           reportedBy: req.user._id,
-          remarks: `${String(discrepancyReason).trim()}. ${remarks}`.trim()
+          movementId: movementResult.movement._id,
+          remarks: [discrepancyLabel, String(remarks).trim()].filter(Boolean).join('. ')
         }], { session });
         verification.adjustmentId = adjustment._id;
+        movements.push(movementResult.movement._id);
       }
       verification.movementIds = movements;
       await verification.save({ session });
@@ -387,7 +402,14 @@ export const createStockVerification = async (req, res, next) => {
 
 export const getStockLocations = async (req, res, next) => {
   try {
-    const balances = await InventoryBalance.find(tenantFilter(req))
+    const filter = tenantFilter(req);
+    if (req.query.itemId) {
+      if (!mongoose.isValidObjectId(req.query.itemId)) {
+        return res.status(400).json({ success: false, message: 'Choose a valid inventory item to view its stock locations.' });
+      }
+      filter.itemId = req.query.itemId;
+    }
+    const balances = await InventoryBalance.find(filter)
       .populate('itemId', 'name code unit currentStock unitCost')
       .sort({ location: 1 })
       .lean();
@@ -519,6 +541,7 @@ export const getStockAdjustments = async (req, res, next) => {
 
 export const createStockAdjustment = async (req, res, next) => {
   try {
+    if (!adminOnly(req, res)) return;
     const { itemId, quantity, reason, department, location, remarks } = req.body;
     const amount = Number(quantity);
     const reasons = ['expired', 'damaged', 'food_wastage', 'spillage', 'missing', 'physical_mismatch', 'internal_usage'];
@@ -531,88 +554,59 @@ export const createStockAdjustment = async (req, res, next) => {
     if (!item) return res.status(404).json({ success: false, message: 'Active inventory item not found.' });
     const unit = normalizeInventoryUnit(req.body.unit || item.baseUnit || item.unit);
     const converted = convertQuantityToBase(item, amount, unit);
-    const adjustment = await StockAdjustment.create({
-      ...tenantFilter(req),
-      itemId,
-      quantity: amount,
-      unit: converted.unit,
-      baseUnit: item.baseUnit || item.unit,
-      conversionFactor: converted.factor,
-      reason,
-      department: department || '',
-      location: location || 'Main Store',
-      remarks: remarks || '',
-      reportedBy: req.user._id
-    });
-    res.status(201).json({ success: true, data: adjustment });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const reviewStockAdjustment = async (req, res, next) => {
-  try {
-    if (!adminOnly(req, res)) return;
-    const { decision } = req.body;
-    if (!['approve', 'reject'].includes(decision)) {
-      return res.status(400).json({ success: false, message: 'Decision must be approve or reject.' });
-    }
     const result = await runInventoryTransaction(async (session) => {
-      const adjustment = await StockAdjustment.findOne({
-        _id: req.params.id, ...tenantFilter(req), status: 'pending'
-      }).session(session);
-      if (!adjustment) throw Object.assign(new Error('Pending stock adjustment not found.'), { statusCode: 404 });
-      adjustment.status = decision === 'approve' ? 'approved' : 'rejected';
-      adjustment.approvedBy = req.user._id;
-      adjustment.approvedAt = new Date();
-      if (decision === 'approve') {
-        const movementType = {
-          expired: 'expiry',
-          damaged: 'wastage',
-          food_wastage: 'wastage',
-          spillage: 'wastage',
-          missing: 'wastage',
-          physical_mismatch: 'physical_count',
-          internal_usage: 'issue'
-        }[adjustment.reason];
-        const movement = await postStockMovement({
-          hotelId: req.hotelId,
-          propertyId: req.propertyId,
-          itemId: adjustment.itemId,
-          movementType,
-          quantity: adjustment.quantity,
-          unit: adjustment.unit || undefined,
-          conversionFactor: adjustment.conversionFactor || undefined,
-          location: adjustment.location,
-          department: adjustment.department,
-          referenceNumber: `ADJ-${adjustment._id}`,
-          notes: `${adjustment.reason}: ${adjustment.remarks}`,
-          recordedBy: req.user._id,
-          idempotencyKey: `stock-adjustment:${adjustment._id}`,
-          session
-        });
-        adjustment.movementId = movement.movement._id;
-      }
-      const verification = await StockVerification.findOne({
-        ...tenantFilter(req), adjustmentId: adjustment._id
-      }).session(session);
-      if (verification) {
-        verification.status = decision === 'approve' ? 'approved' : 'rejected';
-        if (decision === 'approve') verification.movementIds.push(adjustment.movementId);
-        await verification.save({ session });
-      }
+      const [adjustment] = await StockAdjustment.create([{
+        ...tenantFilter(req),
+        itemId,
+        quantity: amount,
+        unit: converted.unit,
+        baseUnit: item.baseUnit || item.unit,
+        conversionFactor: converted.factor,
+        reason,
+        department: department || '',
+        location: location || 'Main Store',
+        remarks: remarks || '',
+        status: 'approved',
+        reportedBy: req.user._id
+      }], { session });
+      const movementType = {
+        expired: 'expiry',
+        damaged: 'wastage',
+        food_wastage: 'wastage',
+        spillage: 'wastage',
+        missing: 'wastage',
+        physical_mismatch: 'physical_count',
+        internal_usage: 'issue'
+      }[reason];
+      const movement = await postStockMovement({
+        hotelId: req.hotelId,
+        propertyId: req.propertyId,
+        itemId,
+        movementType,
+        quantity: amount,
+        unit: converted.unit,
+        conversionFactor: converted.factor,
+        location: location || 'Main Store',
+        department: department || '',
+        referenceNumber: `ADJ-${adjustment._id}`,
+        notes: `${reason}: ${remarks || ''}`.trim(),
+        recordedBy: req.user._id,
+        idempotencyKey: `stock-adjustment:${adjustment._id}`,
+        session
+      });
+      adjustment.movementId = movement.movement._id;
       await adjustment.save({ session });
       return adjustment;
     });
     await logAudit({
       hotelId: req.hotelId,
-      action: `STOCK_ADJUSTMENT_${decision.toUpperCase()}`,
+      action: 'RECORD_STOCK_ADJUSTMENT',
       entity: 'StockAdjustment',
       entityId: result._id,
       details: { itemId: String(result.itemId), quantity: result.quantity, reason: result.reason },
       req
     });
-    res.json({ success: true, data: result });
+    res.status(201).json({ success: true, data: result });
   } catch (err) {
     next(err);
   }

@@ -56,7 +56,6 @@ import {
   updateInventorySettings,
   reviewDepartmentRequest,
   saveRecipe,
-  reviewStockAdjustment,
   reconcileMinibar,
   transferStockBetweenLocations
 } from '../controllers/inventoryAdvancedController.js';
@@ -98,7 +97,6 @@ router.post('/transfers', authorize(ROLES.HOTEL_ADMIN), transferStockBetweenLoca
 router.get('/ledger', getStockLedger);
 router.get('/adjustments', getStockAdjustments);
 router.post('/adjustments', createStockAdjustment);
-router.patch('/adjustments/:id/review', reviewStockAdjustment);
 router.get('/reorder-suggestions', getReorderSuggestions);
 router.get('/reports/export', exportInventoryReport);
 router.get('/reports', getInventoryReport);

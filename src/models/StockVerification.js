@@ -19,7 +19,7 @@ const stockVerificationSchema = new mongoose.Schema({
   unit: { type: String, trim: true, required: true },
   discrepancyReason: { type: String, trim: true, default: '' },
   remarks: { type: String, trim: true, default: '' },
-  status: { type: String, enum: ['pending', 'verified', 'approved', 'rejected'], default: 'verified', index: true },
+  status: { type: String, enum: ['pending', 'verified', 'approved', 'rejected'], default: 'approved', index: true },
   adjustmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'StockAdjustment', default: null },
   movementIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'StockMovement' }],
   verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
