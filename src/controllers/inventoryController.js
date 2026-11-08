@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import {
-  DepartmentRequest, GoodsReceipt, InventoryBatch, InventoryItem, InventoryRecipe, StockReceiptRequest, Unit,
+  DepartmentRequest, GoodsReceipt, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, StockReceiptRequest, Unit,
   MinibarStock, MinibarTransaction, StockMovement, StockVerification, SupplierPayment, Vendor, PurchaseOrder
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
@@ -217,7 +217,7 @@ export const getInventoryBatches = async (req, res, next) => {
       _id: itemId,
       hotelId: req.hotelId,
       propertyId: req.propertyId
-    }).select('_id');
+    }).select('_id currentStock unitCost location baseUnit unit');
     if (!item) {
       return res.status(404).json({ success: false, message: 'Inventory item not found.' });
     }
@@ -230,12 +230,57 @@ export const getInventoryBatches = async (req, res, next) => {
       .populate('vendorId', 'name')
       .sort({ receivedAt: 1, _id: 1 })
       .lean();
+    const balances = await InventoryBalance.find({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      ...(req.query.location ? { location: String(req.query.location).trim() } : {})
+    }).select('location quantity').lean();
+    const batchQuantityByLocation = new Map();
+    for (const batch of batches) {
+      const location = batch.location || 'Main Store';
+      batchQuantityByLocation.set(
+        location,
+        (batchQuantityByLocation.get(location) || 0) + (Number(batch.remainingQuantity) || 0)
+      );
+    }
+    const stockByLocation = balances.length
+      ? balances
+      : [{
+        location: String(req.query.location || item.location || 'Main Store').trim(),
+        quantity: item.currentStock
+      }];
+    const legacyBatches = stockByLocation.flatMap((balance) => {
+      const location = balance.location || 'Main Store';
+      const untrackedQuantity = Math.max(
+        0,
+        (Number(balance.quantity) || 0) - (batchQuantityByLocation.get(location) || 0)
+      );
+      if (untrackedQuantity <= 1e-8) return [];
+      return [{
+        _id: `legacy-${item._id}-${encodeURIComponent(location)}`,
+        itemId: item._id,
+        location,
+        batchNumber: 'Untracked stock',
+        quantity: untrackedQuantity,
+        remainingQuantity: untrackedQuantity,
+        unitCost: item.unitCost,
+        purchaseQuantity: null,
+        purchaseUnit: '',
+        purchaseUnitCost: null,
+        purchaseAmount: null,
+        vendorId: null,
+        receivedAt: null,
+        legacyStock: true,
+        status: 'untracked'
+      }];
+    });
     res.json({
       success: true,
-      data: batches.map((batch) => ({
+      data: [...batches.map((batch) => ({
         ...batch,
         status: batch.remainingQuantity > 0 ? 'open' : 'closed'
-      }))
+      })), ...legacyBatches]
     });
   } catch (error) {
     next(error);

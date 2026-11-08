@@ -5,7 +5,7 @@ import {
 } from '../controllers/inventoryAdvancedController.js';
 import { getInventoryBatches } from '../controllers/inventoryController.js';
 import {
-  AuditLog, FoodOrder, Hotel, InventoryBatch, InventoryItem, RecipeConsumption,
+  AuditLog, FoodOrder, Hotel, InventoryBalance, InventoryBatch, InventoryItem, RecipeConsumption,
   StockAdjustment, StockMovement, StockReceiptRequest, StockVerification
 } from '../models/index.js';
 import {
@@ -101,6 +101,104 @@ describe('raw material inventory workflow', () => {
       suggestedQuantity: 7,
       suggestedUnit: 'kg'
     });
+  });
+
+  it('shows on-hand stock without batch records as untracked legacy stock', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await createItem();
+    item.hotelId = isolatedHotelId;
+    item.propertyId = isolatedPropertyId;
+    item.currentStock = 7;
+    await item.save();
+    await InventoryBalance.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      location: 'Main Store',
+      quantity: 7
+    });
+
+    const response = await invoke(getInventoryBatches, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: { itemId: String(item._id), location: 'Main Store' }
+    });
+
+    expect(response.body.data).toHaveLength(1);
+    expect(response.body.data[0]).toMatchObject({
+      itemId: item._id,
+      location: 'Main Store',
+      batchNumber: 'Untracked stock',
+      quantity: 7,
+      remainingQuantity: 7,
+      unitCost: item.unitCost,
+      purchaseUnit: '',
+      purchaseUnitCost: null,
+      purchaseAmount: null,
+      legacyStock: true,
+      status: 'untracked'
+    });
+  });
+
+  it('does not duplicate tracked batch stock or include another location', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await createItem();
+    item.hotelId = isolatedHotelId;
+    item.propertyId = isolatedPropertyId;
+    item.currentStock = 7;
+    await item.save();
+    await InventoryBatch.create([
+      {
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        location: 'Main Store',
+        batchNumber: 'MAIN-001',
+        quantity: 5,
+        remainingQuantity: 5,
+        unitCost: 60
+      },
+      {
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        location: 'Kitchen',
+        batchNumber: 'KITCHEN-001',
+        quantity: 2,
+        remainingQuantity: 2,
+        unitCost: 60
+      }
+    ]);
+    await InventoryBalance.create([
+      {
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        location: 'Main Store',
+        quantity: 5
+      },
+      {
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        location: 'Kitchen',
+        quantity: 2
+      }
+    ]);
+
+    const response = await invoke(getInventoryBatches, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: { itemId: String(item._id), location: 'Main Store' }
+    });
+
+    expect(response.body.data).toHaveLength(1);
+    expect(response.body.data[0].batchNumber).toBe('MAIN-001');
+    expect(response.body.data[0].legacyStock).toBeUndefined();
   });
 
   it('calculates inventory profit and loss from settled recipe-linked sales and stock losses', async () => {
