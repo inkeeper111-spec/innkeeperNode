@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import {
   DepartmentRequest, GoodsReceipt, InventoryBatch, InventoryItem, InventoryRecipe, StockReceiptRequest, Unit,
-  MinibarStock, MinibarTransaction, StockMovement, SupplierPayment, Vendor, PurchaseOrder
+  MinibarStock, MinibarTransaction, StockMovement, StockVerification, SupplierPayment, Vendor, PurchaseOrder
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
@@ -185,9 +185,19 @@ export const getInventoryItems = async (req, res, next) => {
       { $match: { hotelId: req.hotelId, propertyId: req.propertyId, itemId: { $in: items.map((item) => item._id) }, expiryDate: { $lte: new Date() }, remainingQuantity: { $gt: 0 } } },
       { $group: { _id: '$itemId', quantity: { $sum: '$remainingQuantity' } } }
     ]);
+    const lastVerifications = await StockVerification.aggregate([
+      { $match: { hotelId: req.hotelId, propertyId: req.propertyId, itemId: { $in: items.map((item) => item._id) } } },
+      { $sort: { verifiedAt: -1 } },
+      { $group: { _id: '$itemId', periodEnd: { $first: '$periodEnd' } } }
+    ]);
     const expiredByItem = new Map(expiredBatches.map((batch) => [String(batch._id), batch.quantity]));
+    const lastVerifiedByItem = new Map(lastVerifications.map((verification) => [
+      String(verification._id),
+      verification.periodEnd
+    ]));
     const rows = items.map((item) => ({
       ...item,
+      lastVerifiedPeriodEnd: lastVerifiedByItem.get(String(item._id)) || null,
       availableStock: Math.max(0, item.currentStock - (expiredByItem.get(String(item._id)) || 0))
     }));
 
@@ -838,16 +848,24 @@ export const recordStockMovement = async (req, res, next) => {
       itemId, movementType, quantity, notes, referenceNumber, location, department, idempotencyKey
     } = req.body;
     const receiptLocation = String(location || 'Main Store').trim() || 'Main Store';
+    const transactionReferenceNumber = referenceNumber || generateReference('MOV');
     const autoGenerateBatchNumber = req.body.autoGenerateBatchNumber === true;
     const hasWastageQuantity = req.body.wastageQuantity !== undefined;
     const wastageQuantity = hasWastageQuantity ? Number(req.body.wastageQuantity) : 0;
+    const existingStockDeductionQuantity = Number(req.body.existingStockDeductionQuantity || 0);
     if (hasWastageQuantity && (!Number.isFinite(wastageQuantity) || wastageQuantity < 0)) {
       return res.status(400).json({ success: false, message: 'Enter a valid non-negative wastage quantity.' });
+    }
+    if (!Number.isFinite(existingStockDeductionQuantity) || existingStockDeductionQuantity < 0) {
+      return res.status(400).json({ success: false, message: 'Enter a valid non-negative existing-stock deduction.' });
     }
     if (wastageQuantity > 0
       && (movementType !== 'receipt' || !autoGenerateBatchNumber
         || !String(req.body.wastageUnit || '').trim() || !String(req.body.wastageReason || '').trim())) {
       return res.status(400).json({ success: false, message: 'Wastage requires a raw-material receipt, configured wastage unit, and reason.' });
+    }
+    if (existingStockDeductionQuantity > 0 && (movementType !== 'receipt' || !autoGenerateBatchNumber)) {
+      return res.status(400).json({ success: false, message: 'Existing-stock deductions require a raw-material receipt.' });
     }
     if (!['receipt', 'issue', 'adjustment', 'wastage', 'return'].includes(movementType)) {
       return res.status(400).json({ success: false, message: 'Unsupported stock movement type.' });
@@ -857,8 +875,10 @@ export const recordStockMovement = async (req, res, next) => {
     }
     let receiptMaterial = null;
     let wastageUnitEntry = null;
+    let deductionUnitEntry = null;
     let wastageReason = '';
     let wastageBaseQuantity = 0;
+    let existingStockDeduction = 0;
     if (autoGenerateBatchNumber) {
       receiptMaterial = await InventoryItem.findOne({
         _id: itemId,
@@ -889,36 +909,25 @@ export const recordStockMovement = async (req, res, next) => {
           selectedReceiptUnit.conversionFactorToBase
         );
         if (!Number.isFinite(wastageBaseQuantity) || wastageBaseQuantity <= 0
-          || !Number.isFinite(receiptBaseQuantity) || receiptBaseQuantity <= 0
-          || wastageBaseQuantity > receiptBaseQuantity) {
+          || !Number.isFinite(receiptBaseQuantity) || receiptBaseQuantity <= 0) {
           return res.status(400).json({
             success: false,
-            message: `Wastage cannot exceed the fresh receipt quantity in ${receiptMaterial.baseUnit || receiptMaterial.unit}.`
+            message: `Enter valid receipt and wastage quantities in ${receiptMaterial.baseUnit || receiptMaterial.unit}.`
           });
         }
       }
-    }
-    if (movementType === 'receipt' && autoGenerateBatchNumber && mongoose.isValidObjectId(itemId)) {
-      const rawMaterial = await InventoryItem.findOne({
-        _id: itemId,
-        hotelId: req.hotelId,
-        propertyId: req.propertyId,
-        inventoryType: 'raw_material'
-      }).select('_id');
-      if (rawMaterial) {
-        const previousBatchAvailable = await InventoryBatch.exists({
-          hotelId: req.hotelId,
-          propertyId: req.propertyId,
-          itemId: rawMaterial._id,
-          location: receiptLocation,
-          remainingQuantity: { $gt: 0 }
-        });
-        if (previousBatchAvailable) {
-          return res.status(409).json({
-            success: false,
-            message: 'This raw material still has stock in an earlier batch. Submit the receipt for approval before adding another batch.'
-          });
+      if (existingStockDeductionQuantity > 0) {
+        deductionUnitEntry = getConfiguredRawMaterialUnit(
+          receiptMaterial,
+          req.body.existingStockDeductionUnit || receiptMaterial.baseUnit || receiptMaterial.unit
+        );
+        if (!deductionUnitEntry) {
+          return res.status(400).json({ success: false, message: 'Choose a configured unit for the existing-stock deduction.' });
         }
+        existingStockDeduction = quantityInBaseUnit(
+          existingStockDeductionQuantity,
+          deductionUnitEntry.conversionFactorToBase
+        );
       }
     }
     let vendorId = null;
@@ -937,7 +946,7 @@ export const recordStockMovement = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Only hotel administrators can post direct stock adjustments.' });
     }
     if (!isAdministrator(req.user) && movementType !== 'issue') {
-      return res.status(403).json({ success: false, message: 'Use an approved goods receipt or submit a stock adjustment request for this movement.' });
+      return res.status(403).json({ success: false, message: 'Only hotel administrators can receive stock or post direct stock adjustments.' });
     }
     if (movementType === 'issue' && !department?.trim()) {
       return res.status(400).json({ success: false, message: 'Department is required for stock issues.' });
@@ -945,6 +954,59 @@ export const recordStockMovement = async (req, res, next) => {
 
     const movementIdempotencyKey = idempotencyKey || req.get('Idempotency-Key');
     const result = await runInventoryTransaction(async (session) => {
+      let deductionMovement = null;
+      let previousBatchIds = [];
+      let previousBatchNumbers = new Map();
+      if (existingStockDeduction > 0 || wastageBaseQuantity > 0) {
+        const previousBatches = await InventoryBatch.find({
+          hotelId: req.hotelId,
+          propertyId: req.propertyId,
+          itemId,
+          location: receiptLocation,
+          remainingQuantity: { $gt: 0 }
+        }).sort({ receivedAt: 1, _id: 1 }).session(session);
+        const previousAvailableQuantity = previousBatches.reduce(
+          (total, batch) => total + batch.remainingQuantity, 0
+        );
+        if (existingStockDeduction > previousAvailableQuantity) {
+          throw Object.assign(new Error(
+            `The existing-stock deduction cannot exceed the ${previousAvailableQuantity} ${receiptMaterial.baseUnit || receiptMaterial.unit} available in earlier batches.`
+          ), { statusCode: 409 });
+        }
+        previousBatchIds = previousBatches.map((batch) => batch._id);
+        previousBatchNumbers = new Map(previousBatches.map((batch) => [
+          String(batch._id),
+          batch.batchNumber || String(batch._id)
+        ]));
+        const wastageEligibleQuantity = quantityInBaseUnit(
+          Number(quantity),
+          getConfiguredRawMaterialUnit(receiptMaterial, req.body.unit)?.conversionFactorToBase || 0
+        ) + (existingStockDeduction > 0 ? previousAvailableQuantity - existingStockDeduction : 0);
+        if (wastageBaseQuantity > wastageEligibleQuantity) {
+          throw Object.assign(new Error(
+            `Wastage cannot exceed the ${receiptMaterial.baseUnit || receiptMaterial.unit} stock eligible after the existing-stock deduction and fresh receipt.`
+          ), { statusCode: 400 });
+        }
+        if (existingStockDeduction > 0) {
+          const deductionResult = await postStockMovement({
+            hotelId: req.hotelId,
+            propertyId: req.propertyId,
+            itemId,
+            movementType: 'issue',
+            quantity: existingStockDeduction,
+            unit: receiptMaterial.baseUnit || receiptMaterial.unit,
+            batchIds: previousBatchIds,
+            location: receiptLocation,
+            department: department || '',
+            notes: 'Existing stock deducted during raw-material restock.',
+            referenceNumber: `${transactionReferenceNumber}-USE`,
+            recordedBy: req.user._id,
+            idempotencyKey: movementIdempotencyKey ? `${movementIdempotencyKey}:existing-stock-deduction` : undefined,
+            session
+          });
+          deductionMovement = deductionResult.movement;
+        }
+      }
       const receiptResult = await postStockMovement({
         hotelId: req.hotelId,
         propertyId: req.propertyId,
@@ -960,7 +1022,7 @@ export const recordStockMovement = async (req, res, next) => {
         packageQuantity: req.body.packageQuantity,
         looseQuantity: req.body.looseQuantity,
         notes: notes || '',
-        referenceNumber: referenceNumber || generateReference('MOV'),
+        referenceNumber: transactionReferenceNumber,
         location: movementType === 'receipt' ? receiptLocation : location || 'Main Store',
         department: department || '',
         batchNumber: req.body.batchNumber || '',
@@ -975,7 +1037,9 @@ export const recordStockMovement = async (req, res, next) => {
         idempotencyKey: movementIdempotencyKey,
         session
       });
-      if (receiptResult.duplicate || wastageBaseQuantity <= 0) return receiptResult;
+      if (receiptResult.duplicate || wastageBaseQuantity <= 0) {
+        return { ...receiptResult, deductionMovement };
+      }
 
       const freshBatch = await InventoryBatch.findOne({
         hotelId: req.hotelId,
@@ -984,9 +1048,13 @@ export const recordStockMovement = async (req, res, next) => {
         location: receiptLocation,
         batchNumber: receiptResult.movement.batchNumber
       }).sort({ receivedAt: -1, _id: -1 }).session(session);
-      if (!freshBatch || freshBatch.remainingQuantity < wastageBaseQuantity) {
-        throw Object.assign(new Error('Fresh receipt batch does not contain enough stock for the entered wastage.'), { statusCode: 409 });
+      if (!freshBatch) {
+        throw Object.assign(new Error('Fresh receipt batch was not found while recording its wastage.'), { statusCode: 409 });
       }
+      previousBatchNumbers.set(
+        String(freshBatch._id),
+        freshBatch.batchNumber || String(freshBatch._id)
+      );
       const wastageResult = await postStockMovement({
         hotelId: req.hotelId,
         propertyId: req.propertyId,
@@ -994,23 +1062,36 @@ export const recordStockMovement = async (req, res, next) => {
         movementType: 'wastage',
         quantity: wastageBaseQuantity,
         unit: receiptMaterial.baseUnit || receiptMaterial.unit,
-        batchIds: [freshBatch._id],
+        batchIds: existingStockDeduction > 0
+          ? [...previousBatchIds, freshBatch._id]
+          : [freshBatch._id],
         batchNumber: freshBatch.batchNumber || '',
         location: receiptLocation,
         department: department || '',
-        notes: `Wastage during stock receipt: ${wastageReason}. Affected batch: ${freshBatch.batchNumber || freshBatch._id}.`,
+        notes: `Wastage during stock receipt: ${wastageReason}.`,
         referenceNumber: `${receiptResult.movement.referenceNumber}-WASTE`,
         recordedBy: req.user._id,
         idempotencyKey: movementIdempotencyKey ? `${movementIdempotencyKey}:wastage` : undefined,
         metadata: {
           reason: wastageReason,
           source: 'raw_material_receipt',
-          receiptMovementId: String(receiptResult.movement._id),
-          batchNumbers: [freshBatch.batchNumber || String(freshBatch._id)]
+          receiptMovementId: String(receiptResult.movement._id)
         },
         session
       });
-      return { ...wastageResult, movement: receiptResult.movement, wastageMovement: wastageResult.movement };
+      wastageResult.movement.metadata = {
+        ...wastageResult.movement.metadata,
+        batchNumbers: wastageResult.movement.batchAllocations.map((allocation) => (
+          previousBatchNumbers.get(String(allocation.batchId)) || 'legacy'
+        ))
+      };
+      await wastageResult.movement.save({ session });
+      return {
+        ...wastageResult,
+        movement: receiptResult.movement,
+        wastageMovement: wastageResult.movement,
+        deductionMovement
+      };
     });
     if (result.duplicate) {
       return res.json({ success: true, message: 'Stock movement was already recorded.', data: { movement: result.movement } });
@@ -1056,7 +1137,12 @@ export const recordStockMovement = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: 'Stock movement recorded successfully.',
-      data: { movement, item, wastageMovement: result.wastageMovement || null }
+      data: {
+        movement,
+        item,
+        wastageMovement: result.wastageMovement || null,
+        deductionMovement: result.deductionMovement || null
+      }
     });
   } catch (err) {
     next(err);
@@ -1079,7 +1165,7 @@ export const createVendor = async (req, res, next) => {
       taxNumber = req.body.gstNumber || '', paymentTerms = 'Net 30', suppliedItems = []
     } = req.body;
     if (!name?.trim() || !phone?.trim()) {
-      return res.status(400).json({ success: false, message: 'Supplier name and phone number are required.' });
+      return res.status(400).json({ success: false, message: 'Vendor name and phone number are required.' });
     }
     if (!Array.isArray(suppliedItems)) {
       return res.status(400).json({ success: false, message: 'Supplied items must be a list.' });
@@ -1089,7 +1175,7 @@ export const createVendor = async (req, res, next) => {
         _id: { $in: suppliedItems }, hotelId: req.hotelId, propertyId: req.propertyId
       });
       if (count !== new Set(suppliedItems.map(String)).size) {
-        return res.status(400).json({ success: false, message: 'Supplier contains an item from another property or an invalid item.' });
+        return res.status(400).json({ success: false, message: 'Vendor contains an item from another property or an invalid item.' });
       }
     }
     const vendor = await Vendor.create({
@@ -1129,7 +1215,7 @@ export const updateVendor = async (req, res, next) => {
         _id: { $in: updates.suppliedItems }, hotelId: req.hotelId, propertyId: req.propertyId
       });
       if (count !== new Set(updates.suppliedItems.map(String)).size) {
-        return res.status(400).json({ success: false, message: 'Supplier contains an item from another property or an invalid item.' });
+        return res.status(400).json({ success: false, message: 'Vendor contains an item from another property or an invalid item.' });
       }
     }
     const vendor = await Vendor.findOneAndUpdate(
@@ -1137,7 +1223,7 @@ export const updateVendor = async (req, res, next) => {
       { $set: updates },
       { new: true, runValidators: true }
     ).populate('suppliedItems', 'name code unit');
-    if (!vendor) return res.status(404).json({ success: false, message: 'Supplier not found.' });
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
     res.json({ success: true, data: vendor });
   } catch (err) {
     next(err);
@@ -1147,7 +1233,7 @@ export const updateVendor = async (req, res, next) => {
 export const getVendorPurchases = async (req, res, next) => {
   try {
     const vendorExists = await Vendor.exists({ _id: req.params.id, hotelId: req.hotelId });
-    if (!vendorExists) return res.status(404).json({ success: false, message: 'Supplier not found.' });
+    if (!vendorExists) return res.status(404).json({ success: false, message: 'Vendor not found.' });
     const data = await PurchaseOrder.find({
       hotelId: req.hotelId,
       propertyId: req.propertyId,
@@ -1162,7 +1248,7 @@ export const getVendorPurchases = async (req, res, next) => {
 export const getVendorPayments = async (req, res, next) => {
   try {
     const vendorExists = await Vendor.exists({ _id: req.params.id, hotelId: req.hotelId });
-    if (!vendorExists) return res.status(404).json({ success: false, message: 'Supplier not found.' });
+    if (!vendorExists) return res.status(404).json({ success: false, message: 'Vendor not found.' });
     const data = await SupplierPayment.find({
       hotelId: req.hotelId,
       propertyId: req.propertyId,
@@ -1178,7 +1264,7 @@ export const recordVendorPayment = async (req, res, next) => {
   try {
     const amount = Number(req.body.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Supplier payment amount must be positive.' });
+      return res.status(400).json({ success: false, message: 'Vendor payment amount must be positive.' });
     }
     const key = req.body.idempotencyKey || req.get('Idempotency-Key');
     const payment = await runInventoryTransaction(async (session) => {
@@ -1194,7 +1280,7 @@ export const recordVendorPayment = async (req, res, next) => {
         $expr: { $gte: [{ $ifNull: ['$outstandingBalance', 0] }, amount] }
       }, { $inc: { outstandingBalance: -amount } }, { new: true, session });
       if (!vendor) {
-        throw Object.assign(new Error('Supplier not found or payment exceeds the outstanding balance.'), { statusCode: 409 });
+        throw Object.assign(new Error('Vendor not found or payment exceeds the outstanding balance.'), { statusCode: 409 });
       }
       const [created] = await SupplierPayment.create([{
         hotelId: req.hotelId,
@@ -1247,7 +1333,7 @@ export const createPurchaseOrder = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'At least one purchase order item is required.' });
     }
     const vendor = await Vendor.findOne({ _id: vendorId, hotelId: req.hotelId, status: 'active' });
-    if (!vendor) return res.status(400).json({ success: false, message: 'An active supplier is required.' });
+    if (!vendor) return res.status(400).json({ success: false, message: 'An active vendor is required.' });
     const purchaseLines = [];
     for (const line of items) {
       if (!Number.isFinite(Number(line.quantity)) || Number(line.quantity) <= 0

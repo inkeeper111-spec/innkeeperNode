@@ -1,12 +1,12 @@
 import mongoose from 'mongoose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  createStockVerification, getInventoryReport, reviewStockAdjustment
+  createStockVerification, getInventoryReport, getReorderSuggestions, getStockAdjustments, reviewStockAdjustment
 } from '../controllers/inventoryAdvancedController.js';
 import { getInventoryBatches } from '../controllers/inventoryController.js';
 import {
-  AuditLog, Hotel, InventoryBatch, InventoryItem, StockAdjustment, StockMovement,
-  StockReceiptRequest, StockVerification
+  AuditLog, FoodOrder, Hotel, InventoryBatch, InventoryItem, RecipeConsumption,
+  StockAdjustment, StockMovement, StockReceiptRequest, StockVerification
 } from '../models/index.js';
 import {
   createStockReceiptRequest, recordStockMovement, reviewStockReceiptRequest
@@ -70,6 +70,141 @@ describe('raw material inventory workflow', () => {
   beforeAll(async () => setup());
   afterAll(async () => teardown());
 
+  it('lists only below-threshold stock with a purchase quantity suggestion', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const lowItem = await createItem();
+    lowItem.hotelId = isolatedHotelId;
+    lowItem.propertyId = isolatedPropertyId;
+    lowItem.currentStock = 3;
+    lowItem.minStockThreshold = 10;
+    await lowItem.save();
+    const atThresholdItem = await createItem();
+    atThresholdItem.hotelId = isolatedHotelId;
+    atThresholdItem.propertyId = isolatedPropertyId;
+    atThresholdItem.currentStock = 10;
+    atThresholdItem.minStockThreshold = 10;
+    await atThresholdItem.save();
+
+    const response = await invoke(getReorderSuggestions, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: {}
+    });
+
+    expect(response.body.data).toHaveLength(1);
+    expect(response.body.data[0]).toMatchObject({
+      _id: lowItem._id,
+      availableStock: 3,
+      minStockThreshold: 10,
+      suggestedQuantity: 7,
+      suggestedUnit: 'kg'
+    });
+  });
+
+  it('calculates inventory profit and loss from settled recipe-linked sales and stock losses', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await createItem();
+    item.hotelId = isolatedHotelId;
+    item.propertyId = isolatedPropertyId;
+    await item.save();
+    const menuItemId = new mongoose.Types.ObjectId();
+    const order = await FoodOrder.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      orderNumber: `PL-${new mongoose.Types.ObjectId()}`,
+      items: [{
+        menuItemId,
+        name: 'Test dish',
+        quantity: 2,
+        unitPrice: 100,
+        amount: 200
+      }],
+      subtotal: 200,
+      taxAmount: 9,
+      discountAmount: 20,
+      totalAmount: 189,
+      status: 'served',
+      paymentStatus: 'paid'
+    });
+    await RecipeConsumption.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      status: 'deducted',
+      deductedAt: new Date('2025-01-15T12:00:00.000Z'),
+      ingredients: [{
+        itemId: item._id,
+        menuItemId,
+        menuItemName: 'Test dish',
+        recipeVersion: 1,
+        quantity: 2,
+        unit: 'kg',
+        unitCost: 30,
+        totalCost: 60
+      }],
+      totalCost: 60
+    });
+    await StockMovement.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      movementType: 'wastage',
+      transactionDate: new Date('2025-01-15T12:00:00.000Z'),
+      quantity: 1,
+      previousStock: 10,
+      newStock: 9,
+      unitCost: 10,
+      totalValue: 10
+    });
+    await StockMovement.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      movementType: 'receipt',
+      transactionDate: new Date('2025-01-15T12:00:00.000Z'),
+      quantity: 10,
+      previousStock: 0,
+      newStock: 10,
+      unitCost: 30,
+      totalValue: 300
+    });
+
+    const response = await invoke(getInventoryReport, {
+      ...requestFor({}),
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      query: {
+        type: 'profit-loss',
+        from: '2025-01-15',
+        to: '2025-01-15'
+      }
+    });
+
+    expect(response.body.data[0]).toMatchObject({
+      salesRevenue: 180,
+      costOfGoodsSold: 60,
+      grossProfit: 120,
+      inventoryLoss: 10,
+      totalInventoryExpenses: 70,
+      netProfit: 110,
+      stockPurchasesNotExpensed: 300,
+      settledOrderCount: 1
+    });
+    expect(response.body.data[0].menuItemBreakdown[0]).toMatchObject({
+      menuItemId: String(menuItemId),
+      name: 'Test dish',
+      quantitySold: 2,
+      salesRevenue: 180,
+      foodCost: 60,
+      grossProfit: 120,
+      grossMarginPercent: 66.67
+    });
+  });
+
   it('allocates reductions FIFO and records the actual batch cost', async () => {
     const item = await createItem();
     await runInventoryTransaction((session) => postStockMovement({
@@ -120,6 +255,54 @@ describe('raw material inventory workflow', () => {
       consumedQuantity: 3,
       consumptionCost: 190
     });
+  });
+
+  it('returns logged wastage with one batch allocation for each affected batch', async () => {
+    const item = await createItem();
+    for (const [batchNumber, quantity] of [['BATCH-1', 2], ['BATCH-2', 2]]) {
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId,
+        propertyId,
+        itemId: item._id,
+        movementType: 'receipt',
+        quantity,
+        unit: 'kg',
+        batchNumber,
+        recordedBy: actorId,
+        session
+      }));
+    }
+
+    const batches = await InventoryBatch.find({ itemId: item._id }).sort({ receivedAt: 1, _id: 1 });
+    const { movement } = await runInventoryTransaction((session) => postStockMovement({
+      hotelId,
+      propertyId,
+      itemId: item._id,
+      movementType: 'wastage',
+      quantity: 3,
+      unit: 'kg',
+      batchIds: batches.map((batch) => batch._id),
+      notes: 'Spoiled during storage',
+      recordedBy: actorId,
+      session
+    }));
+
+    const response = await invoke(getStockAdjustments, requestFor({}));
+    const wastage = response.body.data.find((entry) => String(entry._id) === String(movement._id));
+
+    expect(wastage).toMatchObject({
+      recordType: 'wastage',
+      movementType: 'wastage',
+      itemId: { name: item.name },
+      createdAt: movement.createdAt
+    });
+    expect(wastage.batchAllocations.map((allocation) => ({
+      batchNumber: allocation.batchId.batchNumber,
+      quantity: allocation.quantity
+    }))).toEqual([
+      { batchNumber: 'BATCH-1', quantity: 2 },
+      { batchNumber: 'BATCH-2', quantity: 1 }
+    ]);
   });
 
   it('creates automatic hotel-prefixed raw-material batches and converts purchase price to base-unit cost', async () => {
@@ -259,21 +442,6 @@ describe('raw material inventory workflow', () => {
       recordedBy: actorId,
       session
     }));
-
-    const bypassAttempt = await invoke(recordStockMovement, {
-      ...requestFor({
-        itemId: String(item._id),
-        movementType: 'receipt',
-        quantity: 1,
-        unit: 'kg',
-        purchaseUnitPrice: 220,
-        autoGenerateBatchNumber: true,
-        location: 'Main Store'
-      }),
-      hotelId: hotel._id,
-      user: { _id: actorId, role: 'hotel_admin' }
-    });
-    expect(bypassAttempt.statusCode).toBe(409);
 
     const submitted = await invoke(createStockReceiptRequest, {
       ...requestFor({
@@ -470,7 +638,7 @@ describe('raw material inventory workflow', () => {
     ]);
   });
 
-  it('records direct receipt wastage against the newly created batch only', async () => {
+  it('records direct restock deductions and wastage across existing batches', async () => {
     const hotel = await Hotel.create({
       name: 'Innkeeper Hotel',
       slug: `direct-wastage-${new mongoose.Types.ObjectId()}`,
@@ -509,7 +677,7 @@ describe('raw material inventory workflow', () => {
       unitCost: 0
     });
 
-    const result = await invoke(recordStockMovement, {
+    const firstReceipt = await invoke(recordStockMovement, {
       ...requestFor({
         itemId: String(item._id),
         movementType: 'receipt',
@@ -517,7 +685,40 @@ describe('raw material inventory workflow', () => {
         unit: 'kg',
         purchaseUnitPrice: 200,
         autoGenerateBatchNumber: true,
-        wastageQuantity: 500,
+        location: 'Main Store'
+      }),
+      hotelId: hotel._id,
+      user: { _id: actorId, role: 'hotel_admin' }
+    });
+    expect(firstReceipt.statusCode).toBe(201);
+    const firstBatch = await InventoryBatch.findOne({ itemId: item._id });
+
+    const nonAdminReceipt = await invoke(recordStockMovement, {
+      ...requestFor({
+        itemId: String(item._id),
+        movementType: 'receipt',
+        quantity: 1,
+        unit: 'kg',
+        purchaseUnitPrice: 220,
+        autoGenerateBatchNumber: true,
+        location: 'Main Store'
+      }),
+      hotelId: hotel._id,
+      user: { _id: actorId, role: 'inventory_staff' }
+    });
+    expect(nonAdminReceipt.statusCode).toBe(403);
+
+    const result = await invoke(recordStockMovement, {
+      ...requestFor({
+        itemId: String(item._id),
+        movementType: 'receipt',
+        quantity: 2,
+        unit: 'kg',
+        purchaseUnitPrice: 220,
+        autoGenerateBatchNumber: true,
+        existingStockDeductionQuantity: 1,
+        existingStockDeductionUnit: 'kg',
+        wastageQuantity: 1500,
         wastageUnit: 'g',
         wastageReason: 'Damaged while unpacking',
         location: 'Main Store'
@@ -528,12 +729,17 @@ describe('raw material inventory workflow', () => {
 
     expect(result.statusCode).toBe(201);
     expect(result.body.data.wastageMovement.movementType).toBe('wastage');
-    expect(result.body.data.wastageMovement.quantity).toBe(0.5);
+    expect(result.body.data.wastageMovement.quantity).toBe(1.5);
     expect(result.body.data.item.currentStock).toBe(1.5);
-    const batch = await InventoryBatch.findOne({ itemId: item._id });
-    expect(batch).toMatchObject({ quantity: 2, remainingQuantity: 1.5 });
+    expect(result.body.data.deductionMovement.movementType).toBe('issue');
+    expect(result.body.data.deductionMovement.quantity).toBe(1);
+    const batches = await InventoryBatch.find({ itemId: item._id }).sort({ receivedAt: 1, _id: 1 });
+    expect(batches).toHaveLength(2);
+    expect(batches[0]).toMatchObject({ quantity: 2, remainingQuantity: 0 });
+    expect(batches[1]).toMatchObject({ quantity: 2, remainingQuantity: 1.5 });
     expect(result.body.data.wastageMovement.batchAllocations).toMatchObject([
-      { batchId: batch._id, quantity: 0.5 }
+      { batchId: firstBatch._id, quantity: 1 },
+      { batchId: batches[1]._id, quantity: 0.5 }
     ]);
     expect(await AuditLog.exists({
       action: 'RECORD_RAW_MATERIAL_WASTAGE',
@@ -548,23 +754,46 @@ describe('raw material inventory workflow', () => {
       quantity: 7, unit: 'kg', unitCost: 60, referenceNumber: 'PUR-3', session
     }));
     const today = new Date().toISOString().slice(0, 10);
+    const incorrectStart = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    await expect(invoke(createStockVerification, requestFor({
+      itemId: String(item._id),
+      actualStock: 2,
+      unit: 'kg',
+      periodStart: incorrectStart,
+      periodEnd: today,
+      consumptionQuantity: 1,
+      wastageQuantity: 1,
+      discrepancyReason: 'Unexplained count difference'
+    }))).rejects.toMatchObject({ statusCode: 400 });
+
     const response = await invoke(createStockVerification, requestFor({
       itemId: String(item._id),
       actualStock: 2,
       unit: 'kg',
       periodStart: today,
       periodEnd: today,
-      consumptionQuantity: 1,
+      consumptionQuantity: 1000,
+      consumptionUnit: 'g',
+      consumptionReason: 'Used for staff meals',
       wastageQuantity: 1,
+      wastageUnit: 'kg',
+      wastageReason: 'Spoiled during storage',
       discrepancyReason: 'Unexplained count difference'
     }));
 
     expect(response.statusCode).toBe(201);
     expect(response.body.data.verification.expectedStock).toBe(7);
     expect(response.body.data.verification.actualStock).toBe(2);
+    expect(response.body.data.verification.consumptionQuantity).toBe(1);
+    expect(response.body.data.verification.consumptionReason).toBe('Used for staff meals');
+    expect(response.body.data.verification.wastageReason).toBe('Spoiled during storage');
     expect(response.body.data.verification.discrepancyQuantity).toBe(3);
     expect(response.body.data.verification.status).toBe('pending');
     expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(5);
+    expect(await StockMovement.findOne({ itemId: item._id, movementType: 'issue' }).then((movement) => movement.notes))
+      .toContain('Used for staff meals');
+    expect(await StockMovement.findOne({ itemId: item._id, movementType: 'wastage' }).then((movement) => movement.notes))
+      .toContain('Spoiled during storage');
     const adjustment = await StockAdjustment.findById(response.body.data.verification.adjustmentId);
     await invoke(reviewStockAdjustment, {
       ...requestFor({ decision: 'approve' }),

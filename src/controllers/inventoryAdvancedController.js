@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import {
   DepartmentRequest, GoodsReceipt, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, InventorySettings,
-  StockAdjustment, StockVerification, MinibarStock, MinibarTransaction, PurchaseOrder, RecipeConsumption,
+  FoodOrder, StockAdjustment, StockVerification, MinibarStock, MinibarTransaction, PurchaseOrder, RecipeConsumption,
   StockMovement, Room, Reservation, Invoice
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
@@ -218,15 +218,25 @@ export const createStockVerification = async (req, res, next) => {
   try {
     const {
       itemId, actualStock, unit, periodStart, periodEnd, location = 'Main Store',
-      consumptionQuantity = 0, wastageQuantity = 0, discrepancyReason = '', remarks = ''
+      consumptionQuantity = 0, consumptionUnit, consumptionReason = '',
+      wastageQuantity = 0, wastageUnit, wastageReason = '',
+      discrepancyReason = '', remarks = ''
     } = req.body;
     if (!mongoose.isValidObjectId(itemId) || !String(location).trim()) {
       return res.status(400).json({ success: false, message: 'Select a valid raw material and stock location.' });
     }
     const start = new Date(periodStart);
     const end = new Date(periodEnd);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end || end > new Date()) {
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
       return res.status(400).json({ success: false, message: 'Enter a valid verification period that does not end in the future.' });
+    }
+    const timezoneOffsetMinutes = Number(req.body.timezoneOffsetMinutes || 0);
+    if (!Number.isInteger(timezoneOffsetMinutes) || Math.abs(timezoneOffsetMinutes) > 840) {
+      return res.status(400).json({ success: false, message: 'Enter a valid local timezone offset.' });
+    }
+    const localToday = new Date(Date.now() - timezoneOffsetMinutes * 60000).toISOString().slice(0, 10);
+    if (end.toISOString().slice(0, 10) !== localToday) {
+      return res.status(400).json({ success: false, message: 'Period end must be today.' });
     }
     const numbers = [actualStock, consumptionQuantity, wastageQuantity].map(Number);
     if (numbers.some((value) => !Number.isFinite(value) || value < 0)) {
@@ -244,10 +254,25 @@ export const createStockVerification = async (req, res, next) => {
         _id: itemId, ...tenantFilter(req), isActive: true
       }).session(session);
       if (!item) throw Object.assign(new Error('Active inventory item not found.'), { statusCode: 404 });
+      const previousVerification = await StockVerification.findOne({
+        ...tenantFilter(req),
+        itemId: item._id,
+        location: String(location).trim()
+      }).sort({ verifiedAt: -1 }).session(session);
+      const requiredPeriodStart = previousVerification?.periodEnd
+        ? new Date(previousVerification.periodEnd).toISOString().slice(0, 10)
+        : new Date(new Date(item.createdAt).getTime() - timezoneOffsetMinutes * 60000).toISOString().slice(0, 10);
+      if (start.toISOString().slice(0, 10) !== requiredPeriodStart) {
+        throw Object.assign(new Error('Period start must match the last physical verification date.'), { statusCode: 400 });
+      }
       const selectedUnit = normalizeInventoryUnit(unit || item.baseUnit || item.unit);
       const convertedActual = convertQuantityToBase(item, numbers[0], selectedUnit);
-      const convertedConsumption = convertQuantityToBase(item, numbers[1], selectedUnit);
-      const convertedWastage = convertQuantityToBase(item, numbers[2], selectedUnit);
+      const convertedConsumption = convertQuantityToBase(
+        item, numbers[1], normalizeInventoryUnit(consumptionUnit || selectedUnit)
+      );
+      const convertedWastage = convertQuantityToBase(
+        item, numbers[2], normalizeInventoryUnit(wastageUnit || selectedUnit)
+      );
       const balance = await InventoryBalance.findOne({
         ...tenantFilter(req), itemId: item._id, location: String(location).trim()
       }).session(session);
@@ -283,7 +308,9 @@ export const createStockVerification = async (req, res, next) => {
         expectedStock,
         actualStock: convertedActual.quantity,
         consumptionQuantity: convertedConsumption.quantity,
+        consumptionReason: String(consumptionReason).trim(),
         wastageQuantity: convertedWastage.quantity,
+        wastageReason: String(wastageReason).trim(),
         discrepancyQuantity,
         stockGain,
         unit: item.baseUnit || item.unit,
@@ -299,7 +326,11 @@ export const createStockVerification = async (req, res, next) => {
           hotelId: req.hotelId, propertyId: req.propertyId, itemId: item._id,
           movementType: 'issue', quantity: convertedConsumption.quantity, unit: item.baseUnit || item.unit,
           location: String(location).trim(), referenceNumber: `VER-${verification._id}`,
-          notes: `Physical verification consumption. ${remarks}`.trim(),
+          notes: [
+            'Physical verification consumption.',
+            String(consumptionReason).trim(),
+            String(remarks).trim()
+          ].filter(Boolean).join(' '),
           recordedBy: req.user._id, idempotencyKey: `verification:${verification._id}:consumption`, session
         });
         movements.push(movement.movement._id);
@@ -309,7 +340,11 @@ export const createStockVerification = async (req, res, next) => {
           hotelId: req.hotelId, propertyId: req.propertyId, itemId: item._id,
           movementType: 'wastage', quantity: convertedWastage.quantity, unit: item.baseUnit || item.unit,
           location: String(location).trim(), referenceNumber: `VER-${verification._id}`,
-          notes: `Physical verification wastage. ${remarks}`.trim(),
+          notes: [
+            'Physical verification wastage.',
+            String(wastageReason).trim(),
+            String(remarks).trim()
+          ].filter(Boolean).join(' '),
           recordedBy: req.user._id, idempotencyKey: `verification:${verification._id}:wastage`, session
         });
         movements.push(movement.movement._id);
@@ -437,12 +472,45 @@ export const getStockAdjustments = async (req, res, next) => {
   try {
     const filter = tenantFilter(req);
     if (req.query.status) filter.status = req.query.status;
-    const data = await StockAdjustment.find(filter)
-      .populate('itemId', 'name code unit')
-      .populate('reportedBy approvedBy', 'name')
-      .sort({ createdAt: -1 })
-      .limit(Math.min(200, Number(req.query.limit) || 100))
-      .lean();
+    const limit = Math.min(200, Number(req.query.limit) || 100);
+    const [adjustments, wastageMovements] = await Promise.all([
+      StockAdjustment.find(filter)
+        .populate('itemId', 'name code unit baseUnit')
+        .populate('reportedBy approvedBy', 'name')
+        .populate({
+          path: 'movementId',
+          populate: { path: 'batchAllocations.batchId', select: 'batchNumber' }
+        })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      req.query.status
+        ? []
+        : StockMovement.find({
+          ...tenantFilter(req),
+          movementType: { $in: ['wastage', 'expiry'] }
+        })
+          .populate('itemId', 'name code unit baseUnit')
+          .populate('recordedBy', 'name')
+          .populate('batchAllocations.batchId', 'batchNumber')
+          .sort({ createdAt: -1 })
+          .limit(limit)
+          .lean()
+    ]);
+    const adjustmentMovementIds = new Set(
+      adjustments.map((adjustment) => String(adjustment.movementId?._id || '')).filter(Boolean)
+    );
+    const data = [
+      ...adjustments.map((adjustment) => ({ ...adjustment, recordType: 'adjustment' })),
+      ...wastageMovements
+        .filter((movement) => !adjustmentMovementIds.has(String(movement._id)))
+        .map((movement) => ({ ...movement, recordType: 'wastage' }))
+    ]
+      .sort((left, right) => (
+        new Date(right.movementId?.createdAt || right.createdAt)
+        - new Date(left.movementId?.createdAt || left.createdAt)
+      ))
+      .slice(0, limit);
     res.json({ success: true, data });
   } catch (err) {
     next(err);
@@ -844,7 +912,7 @@ export const getReorderSuggestions = async (req, res, next) => {
     }
     const data = items.filter((item) => (
       Math.max(0, item.currentStock - (expired.get(String(item._id)) || 0))
-        + (pending.get(String(item._id)) || 0) <= item.minStockThreshold
+        + (pending.get(String(item._id)) || 0) < item.minStockThreshold
     )).map((item) => {
       const onOrder = pending.get(String(item._id)) || 0;
       const availableStock = Math.max(0, item.currentStock - (expired.get(String(item._id)) || 0));
@@ -1090,6 +1158,130 @@ export const getInventoryReport = async (req, res, next) => {
     const { type = 'stock', category, department, itemId, from, to } = req.query;
     const scope = tenantFilter(req);
     const createdAt = dateFilter({ from, to });
+    if (type === 'profit-loss') {
+      const recipeConsumptions = await RecipeConsumption.find({
+        ...scope,
+        status: 'deducted',
+        ...(createdAt ? { deductedAt: createdAt } : {})
+      }).select('orderId ingredients deductedAt').lean();
+      const orderIds = [...new Set(recipeConsumptions.map((entry) => String(entry.orderId)))];
+      const [orders, lossMovements, purchaseMovements] = await Promise.all([
+        FoodOrder.find({
+          ...scope,
+          _id: { $in: orderIds },
+          status: 'served',
+          paymentStatus: { $in: ['paid', 'transferred_to_folio'] }
+        }).select('orderNumber items subtotal discountAmount taxAmount totalAmount createdAt').lean(),
+        StockMovement.find({
+          ...scope,
+          movementType: { $in: ['wastage', 'expiry'] },
+          ...(createdAt ? {
+            $or: [
+              { transactionDate: createdAt },
+              { transactionDate: { $exists: false }, createdAt }
+            ]
+          } : {})
+        }).select('totalValue').lean(),
+        StockMovement.find({
+          ...scope,
+          movementType: 'receipt',
+          ...(createdAt ? {
+            $or: [
+              { transactionDate: createdAt },
+              { transactionDate: { $exists: false }, createdAt }
+            ]
+          } : {})
+        }).select('totalValue').lean()
+      ]);
+      const orderById = new Map(orders.map((order) => [String(order._id), order]));
+      const menuItems = new Map();
+      for (const consumption of recipeConsumptions) {
+        const order = orderById.get(String(consumption.orderId));
+        if (!order) continue;
+
+        const orderLines = new Map();
+        for (const line of order.items || []) {
+          const menuItemId = String(line.menuItemId);
+          const lineTotal = Number(line.amount ?? Number(line.quantity || 0) * Number(line.unitPrice || 0));
+          const entry = orderLines.get(menuItemId) || {
+            name: line.name || 'Menu item',
+            quantity: 0,
+            amount: 0
+          };
+          entry.quantity += Number(line.quantity) || 0;
+          entry.amount += Number.isFinite(lineTotal) ? lineTotal : 0;
+          orderLines.set(menuItemId, entry);
+        }
+
+        const recipeCosts = new Map();
+        for (const ingredient of consumption.ingredients || []) {
+          const menuItemId = String(ingredient.menuItemId);
+          const entry = recipeCosts.get(menuItemId) || {
+            name: ingredient.menuItemName || orderLines.get(menuItemId)?.name || 'Menu item',
+            cost: 0
+          };
+          entry.cost += Number(ingredient.totalCost) || 0;
+          recipeCosts.set(menuItemId, entry);
+        }
+
+        const subtotal = Number(order.subtotal) || 0;
+        const discount = Number(order.discountAmount) || 0;
+        for (const [menuItemId, recipeCost] of recipeCosts) {
+          const soldLine = orderLines.get(menuItemId);
+          const menu = menuItems.get(menuItemId) || {
+            menuItemId,
+            name: soldLine?.name || recipeCost.name,
+            quantitySold: 0,
+            salesRevenue: 0,
+            foodCost: 0
+          };
+          if (soldLine) {
+            const discountShare = subtotal > 0 ? discount * soldLine.amount / subtotal : 0;
+            menu.quantitySold += soldLine.quantity;
+            menu.salesRevenue += Math.max(0, soldLine.amount - discountShare);
+          }
+          menu.foodCost += recipeCost.cost;
+          menuItems.set(menuItemId, menu);
+        }
+      }
+
+      const menuItemBreakdown = [...menuItems.values()].map((item) => {
+        const grossProfit = Math.round((item.salesRevenue - item.foodCost) * 100) / 100;
+        return {
+          ...item,
+          salesRevenue: Math.round(item.salesRevenue * 100) / 100,
+          foodCost: Math.round(item.foodCost * 100) / 100,
+          grossProfit,
+          grossMarginPercent: item.salesRevenue > 0
+            ? Math.round((grossProfit / item.salesRevenue) * 10000) / 100
+            : null
+        };
+      }).sort((left, right) => right.salesRevenue - left.salesRevenue);
+      const salesRevenue = menuItemBreakdown.reduce((sum, item) => sum + item.salesRevenue, 0);
+      const costOfGoodsSold = menuItemBreakdown.reduce((sum, item) => sum + item.foodCost, 0);
+      const grossProfit = salesRevenue - costOfGoodsSold;
+      const inventoryLoss = lossMovements.reduce((sum, movement) => sum + movement.totalValue, 0);
+      const netProfit = grossProfit - inventoryLoss;
+      const rounded = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+      return res.json({
+        success: true,
+        data: [{
+          salesRevenue: rounded(salesRevenue),
+          costOfGoodsSold: rounded(costOfGoodsSold),
+          grossProfit: rounded(grossProfit),
+          grossMarginPercent: salesRevenue > 0 ? rounded((grossProfit / salesRevenue) * 100) : null,
+          inventoryLoss: rounded(inventoryLoss),
+          totalInventoryExpenses: rounded(costOfGoodsSold + inventoryLoss),
+          netProfit: rounded(netProfit),
+          netMarginPercent: salesRevenue > 0 ? rounded((netProfit / salesRevenue) * 100) : null,
+          stockPurchasesNotExpensed: rounded(
+            purchaseMovements.reduce((sum, movement) => sum + movement.totalValue, 0)
+          ),
+          settledOrderCount: orders.length,
+          menuItemBreakdown
+        }]
+      });
+    }
     if (type === 'financial') {
       const itemFilter = {
         ...scope,

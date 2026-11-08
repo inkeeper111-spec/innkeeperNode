@@ -2,9 +2,6 @@ import { Router } from 'express';
 import {
   getInventoryItems,
   getInventoryBatches,
-  getStockReceiptRequests,
-  createStockReceiptRequest,
-  reviewStockReceiptRequest,
   createInventoryItem,
   updateInventoryItem,
   recordStockMovement,
@@ -74,9 +71,6 @@ router.use(requireTenant);
 
 router.get('/items', getInventoryItems);
 router.get('/batches', getInventoryBatches);
-router.get('/stock-receipt-requests', getStockReceiptRequests);
-router.post('/stock-receipt-requests', createStockReceiptRequest);
-router.patch('/stock-receipt-requests/:id/review', reviewStockReceiptRequest);
 router.get('/raw-materials/categories', authorize(ROLES.HOTEL_ADMIN), getRawMaterialCategories);
 router.post('/raw-materials/categories', authorize(ROLES.HOTEL_ADMIN), createRawMaterialCategory);
 router.patch('/raw-materials/categories/:id', authorize(ROLES.HOTEL_ADMIN), updateRawMaterialCategory);
