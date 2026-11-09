@@ -13,6 +13,7 @@ import {
   recordVendorPayment,
   getPurchaseOrders,
   createPurchaseOrder,
+  reviewAutomaticReorder,
   receivePurchaseOrderGoods
 } from '../controllers/inventoryController.js';
 import {
@@ -60,6 +61,13 @@ import {
   reconcileMinibar,
   transferStockBetweenLocations
 } from '../controllers/inventoryAdvancedController.js';
+import {
+  cancelProductionEntry,
+  createProductionEntry,
+  getProductionDashboard,
+  recordPreparedFoodMovement,
+  transferProductionBatch
+} from '../controllers/productionController.js';
 import { authenticate, requireTenant, authorize } from '../middlewares/auth.js';
 import { ROLES } from '../config/constants.js';
 import { validatePhoneFields } from '../middlewares/phoneValidator.js';
@@ -111,6 +119,7 @@ router.post('/vendors/:id/payments', authorize(ROLES.HOTEL_ADMIN), recordVendorP
 
 router.get('/purchase-orders', getPurchaseOrders);
 router.post('/purchase-orders', authorize(ROLES.HOTEL_ADMIN), createPurchaseOrder);
+router.patch('/purchase-orders/:id/review', authorize(ROLES.HOTEL_ADMIN), reviewAutomaticReorder);
 router.patch('/purchase-orders/:id/approve', approvePurchaseOrder);
 router.patch('/purchase-orders/:id/receive', authorize(ROLES.HOTEL_ADMIN), receivePurchaseOrderGoods);
 router.get('/goods-receipts', getGoodsReceipts);
@@ -122,6 +131,11 @@ router.patch('/department-requests/:id/review', reviewDepartmentRequest);
 router.get('/recipes', getRecipes);
 router.post('/recipes', authorize(ROLES.HOTEL_ADMIN), saveRecipe);
 router.patch('/recipes/:id/status', authorize(ROLES.HOTEL_ADMIN), setRecipeStatus);
+router.get('/production', getProductionDashboard);
+router.post('/production', createProductionEntry);
+router.post('/production/:id/transfer', transferProductionBatch);
+router.post('/production/:id/cancel', cancelProductionEntry);
+router.post('/production/:id/movements', recordPreparedFoodMovement);
 router.get('/minibar/rooms', getMinibarRooms);
 router.get('/minibar/rooms/:roomId', getMinibarRoomStock);
 router.post('/minibar/rooms/:roomId/stock', assignMinibarStock);

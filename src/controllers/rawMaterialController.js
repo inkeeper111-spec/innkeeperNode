@@ -5,10 +5,12 @@ import {
   RawMaterialCategory,
   RawMaterialSubcategory,
   StockMovement,
-  Unit
+  Unit,
+  Vendor
 } from '../models/index.js';
 import { getUnitConversionFactor, INVENTORY_UNIT_MASTER } from '../config/inventoryUnits.js';
 import { logAudit } from '../services/auditService.js';
+import { evaluateAutomaticReorder, runInventoryTransaction } from '../services/inventoryService.js';
 
 const isAdministrator = (user) => ['hotel_admin', 'super_admin'].includes(user?.role);
 const sendError = (res, status, message) => res.status(status).json({ success: false, message });
@@ -495,10 +497,31 @@ const saveRawMaterial = async ({ req, currentItem = null }) => {
   const { baseUnit, defaultUnit } = unitResult;
   const reorderLevel = Number(req.body.reorderLevel ?? currentItem?.reorderLevel ?? req.body.minStockThreshold ?? currentItem?.minStockThreshold ?? 0);
   const minStockThreshold = Number(req.body.minimumStockLevel ?? req.body.minStockThreshold ?? currentItem?.minStockThreshold ?? 0);
+  const maxStockLevel = Number(req.body.maxStockLevel ?? currentItem?.maxStockLevel ?? 0);
   if (!Number.isFinite(reorderLevel) || reorderLevel < 0
-    || !Number.isFinite(minStockThreshold) || minStockThreshold < 0) {
-    return { error: 'Minimum stock and reorder levels must be non-negative numbers.' };
+    || !Number.isFinite(minStockThreshold) || minStockThreshold < 0
+    || !Number.isFinite(maxStockLevel) || maxStockLevel < 0
+    || (maxStockLevel > 0 && maxStockLevel < reorderLevel)) {
+    return { error: 'Stock levels must be non-negative, and desired stock cannot be below the reorder level.' };
   }
+  const requestedVendorId = req.body.vendorId === undefined
+    ? currentItem?.vendorId
+    : req.body.vendorId || null;
+  let preferredVendor = requestedVendorId
+    ? await Vendor.findOne({
+      _id: requestedVendorId,
+      hotelId: req.hotelId,
+      status: 'active'
+    }).select('_id')
+    : null;
+  if (!preferredVendor && requestedVendorId && currentItem
+    && String(requestedVendorId) === String(currentItem.vendorId || '')) {
+    preferredVendor = await Vendor.findOne({
+      _id: requestedVendorId,
+      hotelId: req.hotelId
+    }).select('_id');
+  }
+  if (requestedVendorId && !preferredVendor) return { error: 'Choose an active preferred supplier belonging to this hotel.' };
 
   if (currentItem && String(currentItem.baseUnitId) !== String(baseUnit._id)) {
     const hasHistory = currentItem.currentStock > 0
@@ -552,6 +575,8 @@ const saveRawMaterial = async ({ req, currentItem = null }) => {
     minStockThreshold,
     reorderLevel,
     reorderQuantity: reorderLevel,
+    maxStockLevel: maxStockLevel > 0 ? maxStockLevel : null,
+    vendorId: preferredVendor?._id || null,
     isActive: req.body.isActive === undefined ? currentItem?.isActive ?? true : req.body.isActive === true
   };
   itemFields.createdBy = currentItem?.createdBy || req.user._id;
@@ -582,6 +607,13 @@ export const createRawMaterial = async (req, res, next) => {
       hotelId: req.hotelId,
       propertyId: req.propertyId
     });
+    await runInventoryTransaction((session) => evaluateAutomaticReorder({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      recordedBy: req.user._id,
+      session
+    }));
     await logAudit({
       hotelId: req.hotelId,
       action: 'CREATE_RAW_MATERIAL',
@@ -618,6 +650,13 @@ export const updateRawMaterial = async (req, res, next) => {
       { new: true, runValidators: true }
     );
     if (!item) return sendError(res, 404, 'Raw material not found.');
+    await runInventoryTransaction((session) => evaluateAutomaticReorder({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemId: item._id,
+      recordedBy: req.user._id,
+      session
+    }));
     await logAudit({
       hotelId: req.hotelId,
       action: 'UPDATE_RAW_MATERIAL',

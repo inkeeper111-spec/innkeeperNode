@@ -2,13 +2,16 @@ import mongoose from 'mongoose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { getInventoryReport, getRecipes, saveRecipe, setRecipeStatus } from '../controllers/inventoryAdvancedController.js';
 import { getInventoryBatches } from '../controllers/inventoryController.js';
-import { updateOrderStatus } from '../controllers/restaurantController.js';
+import { createOrder, getMenu, settleOrder, updateOrderStatus } from '../controllers/restaurantController.js';
+import {
+  cancelProductionEntry, createProductionEntry, getProductionDashboard, transferProductionBatch
+} from '../controllers/productionController.js';
 import {
   FoodOrder, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, InventorySettings,
-  MenuCategory, MenuItem, Property, RecipeConsumption, StockMovement
+  MenuCategory, MenuItem, PreparedFoodMovement, ProductionBatch, Property, RecipeConsumption, StockMovement
 } from '../models/index.js';
 import {
-  consumeRecipesForOrder, postStockMovement, runInventoryTransaction
+  consumePreparedFoodForOrder, consumeRecipesForOrder, postStockMovement, recordPreparedFoodUse, runInventoryTransaction
 } from '../services/inventoryService.js';
 import { setup, teardown } from './setup.js';
 
@@ -123,7 +126,42 @@ describe('recipe-based inventory management', () => {
       estimatedRecipeCost: 0.33,
       sellingPrice: 5,
       estimatedGrossProfit: 4.67,
+      estimatedProfitWhole: 4.67,
+      expectedProductionYield: 1,
+      expectedPreparationLossPercent: 0,
       foodCostPercent: 6.6
+    });
+
+    const bulkMenuItem = await MenuItem.create({
+      hotelId,
+      categoryId: category._id,
+      name: 'Bulk Recipe Test Dish',
+      price: 5
+    });
+    const bulkRecipeResponse = await invoke(saveRecipe, requestFor({
+      propertyId: property._id,
+      body: {
+        menuItemId: String(bulkMenuItem._id),
+        recipeName: 'Bulk Dish Recipe',
+        servingSize: '3 plates',
+        productionMode: 'batch_production',
+        expectedProductionYield: 3,
+        expectedPreparationLossPercent: 10,
+        ingredients: [{ itemId: String(ingredient._id), quantity: 33, unit: 'g' }]
+      }
+    }));
+    expect(bulkRecipeResponse.statusCode).toBe(201);
+    const recipesWithBulk = await invoke(getRecipes, requestFor({ propertyId: property._id }));
+    const bulkRecipe = recipesWithBulk.body.data.find(
+      (recipe) => String(recipe._id) === String(bulkRecipeResponse.body.data._id)
+    );
+    expect(bulkRecipe).toMatchObject({
+      estimatedRecipeCost: 0.12,
+      sellingPrice: 5,
+      expectedProductionYield: 3,
+      expectedPreparationLossPercent: 10,
+      estimatedGrossProfit: 4.88,
+      estimatedProfitWhole: 14.64
     });
 
     const order = await FoodOrder.create({
@@ -366,5 +404,355 @@ describe('recipe-based inventory management', () => {
     expect(noRecipeResult.error).toBeUndefined();
     expect(noRecipeResult.body.data.status).toBe('ready');
     expect(await RecipeConsumption.countDocuments({ orderId: recipeFreeOrder._id })).toBe(0);
+  });
+
+  it('records batch production once, allocates prepared portions at serving, and keeps wastage separate', async () => {
+    const property = await Property.create({
+      hotelId,
+      name: 'Production Test Property',
+      code: `PRD${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      address: '1 Test Road',
+      city: 'Test City',
+      state: 'Test State',
+      phone: '5551234567'
+    });
+    const category = await MenuCategory.create({ hotelId, name: 'Production Recipes' });
+    const menuItem = await MenuItem.create({
+      hotelId,
+      categoryId: category._id,
+      name: 'Batch Production Dish',
+      price: 12
+    });
+    const ingredient = await InventoryItem.create({
+      hotelId,
+      propertyId: property._id,
+      name: 'Production Ingredient',
+      code: `PRI${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      inventoryType: 'raw_material',
+      unit: 'g',
+      baseUnit: 'g',
+      currentStock: 0,
+      trackExpiry: true
+    });
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId,
+      propertyId: property._id,
+      itemId: ingredient._id,
+      movementType: 'receipt',
+      quantity: 1000,
+      unit: 'g',
+      unitCost: 0.02,
+      location: 'Main Store',
+      expiryDate: new Date(Date.now() + 30 * 86400000),
+      batchNumber: 'PRODUCTION-INGREDIENT-1',
+      recordedBy: actorId,
+      session
+    }));
+    const recipe = await InventoryRecipe.create({
+      hotelId,
+      propertyId: property._id,
+      menuItemId: menuItem._id,
+      recipeName: 'Production Dish Recipe',
+      productionMode: 'batch_production',
+      version: 1,
+      ingredients: [{ itemId: ingredient._id, quantity: 10, unit: 'g', conversionFactor: 1, baseUnit: 'g' }],
+      createdBy: actorId
+    });
+    const productionInput = {
+      hotelId,
+      propertyId: property._id,
+      recipeId: recipe._id,
+      productionQuantity: 20,
+      acceptedQuantity: 18,
+      productionMethod: 'recipe_based',
+      location: 'Kitchen Store',
+      rawMaterialLocation: 'Main Store',
+      wastage: [{ itemId: String(ingredient._id), quantity: 5, unit: 'g', reason: 'Trimming' }],
+      recordedBy: actorId,
+      idempotencyKey: `production-test:${new mongoose.Types.ObjectId()}`
+    };
+    const productionResponse = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: productionInput
+    }));
+    expect(productionResponse.statusCode).toBe(201);
+    const production = productionResponse.body.data;
+    expect(production.duplicate).toBe(false);
+    expect(production.batch.acceptedQuantity).toBe(18);
+    expect(production.batch.productionCost).toBe(4);
+    expect(production.batch.rawMaterialWastageCost).toBe(0.1);
+    expect((await InventoryItem.findById(ingredient._id)).currentStock).toBe(795);
+
+    const retry = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: productionInput
+    }));
+    expect(retry.statusCode).toBe(200);
+    expect(retry.body.data.duplicate).toBe(true);
+    expect((await InventoryItem.findById(ingredient._id)).currentStock).toBe(795);
+
+    const secondProductionResponse = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: {
+        ...productionInput,
+        productionQuantity: 3,
+        acceptedQuantity: 3,
+        wastage: [],
+        expiryDate: new Date(Date.now() + 86400000),
+        idempotencyKey: `production-test:${new mongoose.Types.ObjectId()}`
+      }
+    }));
+    expect(secondProductionResponse.statusCode).toBe(201);
+    const secondProduction = secondProductionResponse.body.data;
+    expect((await InventoryItem.findById(ingredient._id)).currentStock).toBe(765);
+
+    const menuResponse = await invoke(getMenu, requestFor({
+      propertyId: property._id,
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    }));
+    const bulkMenuProduct = menuResponse.body.data.items.find(
+      (item) => String(item._id) === String(menuItem._id)
+    );
+    expect(bulkMenuProduct).toMatchObject({
+      fulfillmentSource: 'batch_production',
+      availablePreparedPortions: 21
+    });
+
+    const bulkOrderResponse = await invoke(createOrder, requestFor({
+      propertyId: property._id,
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id },
+      body: {
+        orderType: 'takeaway',
+        items: [{ menuItemId: String(menuItem._id), quantity: 2 }]
+      }
+    }));
+    expect(bulkOrderResponse.statusCode).toBe(201);
+    expect(bulkOrderResponse.body.data.items[0].fulfillmentSource).toBe('batch_production');
+    expect(bulkOrderResponse.body.data.preparedFoodAllocations).toHaveLength(1);
+    expect((await ProductionBatch.findById(production.batch._id)).availableQuantity
+      + (await ProductionBatch.findById(secondProduction.batch._id)).availableQuantity).toBe(19);
+    expect((await ProductionBatch.findById(production.batch._id)).reservedQuantity
+      + (await ProductionBatch.findById(secondProduction.batch._id)).reservedQuantity).toBe(2);
+    expect((await ProductionBatch.findById(production.batch._id)).soldQuantity
+      + (await ProductionBatch.findById(secondProduction.batch._id)).soldQuantity).toBe(0);
+    const cancelBulkOrder = await invoke(updateOrderStatus, requestFor({
+      propertyId: property._id,
+      params: { id: String(bulkOrderResponse.body.data._id) },
+      body: { status: 'cancelled' },
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    }));
+    expect(cancelBulkOrder.error).toBeUndefined();
+    expect((await ProductionBatch.findById(production.batch._id)).availableQuantity
+      + (await ProductionBatch.findById(secondProduction.batch._id)).availableQuantity).toBe(21);
+    expect((await ProductionBatch.findById(production.batch._id)).reservedQuantity
+      + (await ProductionBatch.findById(secondProduction.batch._id)).reservedQuantity).toBe(0);
+
+    const reversibleProduction = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: {
+        ...productionInput,
+        productionQuantity: 2,
+        acceptedQuantity: 2,
+        wastage: [],
+        idempotencyKey: `production-test:${new mongoose.Types.ObjectId()}`
+      }
+    }));
+    expect(reversibleProduction.statusCode).toBe(201);
+    expect((await InventoryItem.findById(ingredient._id)).currentStock).toBe(745);
+    const cancelRequest = () => requestFor({
+      propertyId: property._id,
+      params: { id: String(reversibleProduction.body.data.batch._id) },
+      body: { idempotencyKey: 'cancel-before-use-test' }
+    });
+    const cancelledProduction = await invoke(cancelProductionEntry, cancelRequest());
+    expect(cancelledProduction.error).toBeUndefined();
+    expect(cancelledProduction.body.data.batch.status).toBe('cancelled');
+    expect((await InventoryItem.findById(ingredient._id)).currentStock).toBe(765);
+    const repeatedCancellation = await invoke(cancelProductionEntry, cancelRequest());
+    expect(repeatedCancellation.statusCode).toBe(200);
+    expect(repeatedCancellation.body.data.duplicate).toBe(true);
+
+    const order = await FoodOrder.create({
+      hotelId,
+      propertyId: property._id,
+      orderNumber: `PRD-${new mongoose.Types.ObjectId().toString().slice(-8)}`,
+      items: [
+        { menuItemId: menuItem._id, name: menuItem.name, quantity: 2, unitPrice: 11, amount: 22 },
+        { menuItemId: menuItem._id, name: menuItem.name, quantity: 3, unitPrice: 10, amount: 30 }
+      ],
+      subtotal: 52,
+      totalAmount: 52,
+      status: 'preparing',
+      createdBy: actorId
+    });
+    const cancelledOrder = await FoodOrder.create({
+      hotelId,
+      propertyId: property._id,
+      orderNumber: `PRD-${new mongoose.Types.ObjectId().toString().slice(-8)}`,
+      items: [{ menuItemId: menuItem._id, name: menuItem.name, quantity: 1, unitPrice: 12, amount: 12 }],
+      subtotal: 12,
+      totalAmount: 12,
+      status: 'preparing',
+      createdBy: actorId
+    });
+    const cancelledOrderRequest = (status) => requestFor({
+      propertyId: property._id,
+      params: { id: String(cancelledOrder._id) },
+      body: { status },
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    });
+    await invoke(updateOrderStatus, cancelledOrderRequest('ready'));
+    await invoke(updateOrderStatus, cancelledOrderRequest('cancelled'));
+    expect((await ProductionBatch.findById(production.batch._id)).availableQuantity).toBe(18);
+
+    const restaurantRequest = (status) => requestFor({
+      propertyId: property._id,
+      params: { id: String(order._id) },
+      body: { status },
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    });
+    await invoke(updateOrderStatus, restaurantRequest('ready'));
+    const served = await invoke(updateOrderStatus, restaurantRequest('served'));
+    expect(served.error).toBeUndefined();
+    expect(served.body.data.status).toBe('served');
+    const orderAllocation = served.body.data.preparedFoodAllocations;
+    expect(orderAllocation).toHaveLength(3);
+    expect(orderAllocation.reduce((sum, allocation) => sum + allocation.quantity, 0)).toBe(5);
+    expect(orderAllocation.filter((allocation) => String(allocation.productionBatchId) === String(secondProduction.batch._id))
+      .reduce((sum, allocation) => sum + allocation.quantity, 0)).toBe(3);
+    expect((await ProductionBatch.findById(production.batch._id)).availableQuantity).toBe(16);
+    expect((await ProductionBatch.findById(secondProduction.batch._id)).availableQuantity).toBe(0);
+    const rejectUsedBatchCancellation = await invoke(cancelProductionEntry, requestFor({
+      propertyId: property._id,
+      params: { id: String(production.batch._id) },
+      body: { idempotencyKey: 'cancel-after-sale-test' }
+    }));
+    expect(rejectUsedBatchCancellation.error?.statusCode).toBe(409);
+
+    const repeatedAllocation = await runInventoryTransaction(async (session) => {
+      const currentOrder = await FoodOrder.findById(order._id).session(session);
+      return consumePreparedFoodForOrder(currentOrder, session, actorId);
+    });
+    expect(repeatedAllocation).toHaveLength(3);
+    expect((await ProductionBatch.findById(production.batch._id)).soldQuantity).toBe(2);
+    expect((await ProductionBatch.findById(secondProduction.batch._id)).soldQuantity).toBe(3);
+    expect(await PreparedFoodMovement.countDocuments({
+      orderId: order._id,
+      movementType: 'sale'
+    })).toBe(3);
+    const saleMovements = await PreparedFoodMovement.find({ orderId: order._id, movementType: 'sale' }).lean();
+    expect(saleMovements.reduce((sum, movement) => sum + movement.salesRevenue, 0)).toBe(0);
+    const settledOrder = await invoke(settleOrder, requestFor({
+      propertyId: property._id,
+      params: { id: String(order._id) },
+      body: { paymentMethod: 'cash' },
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    }));
+    expect(settledOrder.error).toBeUndefined();
+    expect(settledOrder.body.data.paymentStatus).toBe('paid');
+    const paidSaleMovements = await PreparedFoodMovement.find({
+      orderId: order._id,
+      movementType: 'sale'
+    }).lean();
+    expect(paidSaleMovements.reduce((sum, movement) => sum + movement.salesRevenue, 0)).toBe(52);
+    const dashboard = await invoke(getProductionDashboard, requestFor({
+      propertyId: property._id,
+      query: {
+        from: new Date(Date.now() - 86400000).toISOString().slice(0, 10),
+        to: new Date().toISOString().slice(0, 10)
+      }
+    }));
+    expect(dashboard.error).toBeUndefined();
+    expect(dashboard.body.data.totals).toMatchObject({
+      acceptedQuantity: 21,
+      soldQuantity: 5,
+      salesRevenue: 52,
+      soldFoodCost: 1.04,
+      grossProfit: 50.96,
+      foodCostPercent: expect.any(Number)
+    });
+    expect(dashboard.body.data.batches.find(
+      (batch) => String(batch._id) === String(production.batch._id)
+    )).toMatchObject({
+      productionCost: 4,
+      costPerPortion: 0.22
+    });
+
+    const insufficientOrder = await FoodOrder.create({
+      hotelId,
+      propertyId: property._id,
+      orderNumber: `PRD-${new mongoose.Types.ObjectId().toString().slice(-8)}`,
+      items: [{ menuItemId: menuItem._id, name: menuItem.name, quantity: 17, unitPrice: 12, amount: 204 }],
+      subtotal: 204,
+      totalAmount: 204,
+      status: 'preparing',
+      createdBy: actorId
+    });
+    const insufficientRequest = (status) => requestFor({
+      propertyId: property._id,
+      params: { id: String(insufficientOrder._id) },
+      body: { status },
+      user: { _id: actorId, role: 'restaurant_staff', propertyId: property._id }
+    });
+    await invoke(updateOrderStatus, insufficientRequest('ready'));
+    const insufficientServe = await invoke(updateOrderStatus, insufficientRequest('served'));
+    expect(insufficientServe.error?.statusCode).toBe(409);
+    expect((await FoodOrder.findById(insufficientOrder._id)).status).toBe('ready');
+    expect((await ProductionBatch.findById(production.batch._id)).availableQuantity).toBe(16);
+
+    const transferRequest = (key) => requestFor({
+      propertyId: property._id,
+      params: { id: String(production.batch._id) },
+      body: {
+        quantity: 4,
+        destinationLocation: 'Dining Outlet',
+        idempotencyKey: key
+      }
+    });
+    const transfer = await invoke(transferProductionBatch, transferRequest('production-transfer-test'));
+    expect(transfer.error).toBeUndefined();
+    expect(transfer.statusCode).toBe(201);
+    expect(transfer.body.data.sourceBatch.availableQuantity).toBe(12);
+    expect(transfer.body.data.targetBatch).toMatchObject({
+      availableQuantity: 4,
+      location: 'Dining Outlet',
+      isTransferBatch: true
+    });
+    const duplicateTransfer = await invoke(transferProductionBatch, transferRequest('production-transfer-test'));
+    expect(duplicateTransfer.statusCode).toBe(200);
+    expect(duplicateTransfer.body.data.duplicate).toBe(true);
+    expect(await PreparedFoodMovement.countDocuments({
+      idempotencyKey: 'production-transfer-test',
+      movementType: 'transfer_out'
+    })).toBe(1);
+
+    await runInventoryTransaction((session) => recordPreparedFoodUse({
+      hotelId,
+      propertyId: property._id,
+      productionBatchId: production.batch._id,
+      movementType: 'wastage',
+      quantity: 2,
+      reason: 'End-of-day spoilage',
+      recordedBy: actorId,
+      idempotencyKey: `wastage-test:${new mongoose.Types.ObjectId()}`
+    }, session));
+    const closedBatch = await ProductionBatch.findById(production.batch._id);
+    expect(closedBatch.availableQuantity).toBe(10);
+    expect(closedBatch.wastedQuantity).toBe(2);
+    expect(await PreparedFoodMovement.countDocuments({ productionBatchId: production.batch._id, movementType: 'wastage' })).toBe(1);
+    const closingDashboard = await invoke(getProductionDashboard, requestFor({
+      propertyId: property._id,
+      query: {
+        from: new Date(Date.now() - 86400000).toISOString().slice(0, 10),
+        to: new Date().toISOString().slice(0, 10)
+      }
+    }));
+    expect(closingDashboard.body.data.totals).toMatchObject({
+      acceptedQuantity: 21,
+      soldQuantity: 5,
+      transferredOutQuantity: 4,
+      wastedQuantity: 2,
+      availableQuantity: 14
+    });
   });
 });

@@ -32,6 +32,8 @@ export { InventoryBatch } from './InventoryBatch.js';
 export { GoodsReceipt } from './GoodsReceipt.js';
 export { InventoryRecipe } from './InventoryRecipe.js';
 export { RecipeConsumption } from './RecipeConsumption.js';
+export { ProductionBatch } from './ProductionBatch.js';
+export { PreparedFoodMovement } from './PreparedFoodMovement.js';
 export { DepartmentRequest } from './DepartmentRequest.js';
 export { StockAdjustment } from './StockAdjustment.js';
 export { StockReceiptRequest } from './StockReceiptRequest.js';

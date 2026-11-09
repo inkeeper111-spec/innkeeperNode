@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import {
   DepartmentRequest, GoodsReceipt, InventoryBalance, InventoryBatch, InventoryItem, InventoryRecipe, InventorySettings,
   FoodOrder, StockAdjustment, StockVerification, MinibarStock, MinibarTransaction, PurchaseOrder, RecipeConsumption,
-  StockMovement, Room, Reservation, Invoice
+  StockMovement, Room, Reservation, Invoice, Vendor
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
@@ -425,7 +425,10 @@ export const getStockLocations = async (req, res, next) => {
 
 export const transferStockBetweenLocations = async (req, res, next) => {
   try {
-    const { itemId, quantity, fromLocation, toLocation, department, notes } = req.body;
+    const {
+      itemId, quantity, fromLocation, toLocation, department, notes,
+      transferMode, fromDepartment, toDepartment
+    } = req.body;
     const result = await runInventoryTransaction((session) => transferStock({
       hotelId: req.hotelId,
       propertyId: req.propertyId,
@@ -435,6 +438,9 @@ export const transferStockBetweenLocations = async (req, res, next) => {
       fromLocation,
       toLocation,
       department: department || '',
+      transferMode: transferMode || 'location',
+      fromDepartment: fromDepartment || '',
+      toDepartment: toDepartment || '',
       recordedBy: req.user._id,
       referenceNumber: generateReference('TRF'),
       idempotencyKey: req.body.idempotencyKey || req.get('Idempotency-Key'),
@@ -868,12 +874,36 @@ export const reconcileMinibar = async (req, res, next) => {
 export const approvePurchaseOrder = async (req, res, next) => {
   try {
     if (!adminOnly(req, res)) return;
+    const pendingOrder = await PurchaseOrder.findOne({
+      _id: req.params.id,
+      ...tenantFilter(req),
+      status: { $in: ['draft', 'pending_approval'] }
+    });
+    if (!pendingOrder) return res.status(404).json({ success: false, message: 'Pending purchase order not found.' });
+    if (!pendingOrder.vendorId) {
+      return res.status(400).json({ success: false, message: 'Select a supplier before approving this purchase order.' });
+    }
+    const activeVendor = await Vendor.findOne({
+      _id: pendingOrder.vendorId,
+      hotelId: req.hotelId,
+      status: 'active'
+    }).select('_id');
+    if (!activeVendor) {
+      return res.status(400).json({ success: false, message: 'Select an active supplier before approving this purchase order.' });
+    }
     const po = await PurchaseOrder.findOneAndUpdate({
-      _id: req.params.id, ...tenantFilter(req), status: { $in: ['draft', 'pending_approval'] }
+      _id: pendingOrder._id,
+      ...tenantFilter(req),
+      status: { $in: ['draft', 'pending_approval'] }
     }, {
-      $set: { status: 'ordered', approvedBy: req.user._id, approvedAt: new Date() }
+      $set: {
+        status: 'ordered',
+        approvedBy: req.user._id,
+        approvedAt: new Date(),
+        autoReorderItemId: null
+      }
     }, { new: true, runValidators: true });
-    if (!po) return res.status(404).json({ success: false, message: 'Pending purchase order not found.' });
+    if (!po) return res.status(409).json({ success: false, message: 'Purchase order status changed; refresh and try again.' });
     await logAudit({
       hotelId: req.hotelId,
       action: 'APPROVE_INVENTORY_PURCHASE_ORDER',
@@ -891,8 +921,10 @@ export const approvePurchaseOrder = async (req, res, next) => {
 export const getReorderSuggestions = async (req, res, next) => {
   try {
     const [items, openOrders, expiredBatches] = await Promise.all([
-      InventoryItem.find({ ...tenantFilter(req), isActive: true }).select('name code unit baseUnit purchaseUnit purchaseConversionFactor packagingOptions unitConversions currentStock minStockThreshold reorderQuantity unitCost vendorId').lean(),
-      PurchaseOrder.find({ ...tenantFilter(req), status: { $in: ['ordered', 'partially_received', 'approved'] } })
+      InventoryItem.find({ ...tenantFilter(req), isActive: true })
+        .select('name code unit baseUnit baseUnitId purchaseUnit purchaseUnitId preferredPurchaseUnitId purchaseConversionFactor supportedUnits packagingOptions unitConversions currentStock minStockThreshold reorderLevel maxStockLevel reorderQuantity unitCost purchasePrice vendorId inventoryType')
+        .lean(),
+      PurchaseOrder.find({ ...tenantFilter(req), status: { $in: ['draft', 'pending_approval', 'ordered', 'partially_received', 'approved'] } })
         .select('items status').lean(),
       InventoryBatch.aggregate([
         { $match: { ...tenantFilter(req), expiryDate: { $lte: new Date() }, remainingQuantity: { $gt: 0 } } },
@@ -908,21 +940,45 @@ export const getReorderSuggestions = async (req, res, next) => {
           + Math.max(0, line.quantity - (line.receivedQuantity || 0)) * (line.conversionFactor || 1));
       }
     }
-    const data = items.filter((item) => (
-      Math.max(0, item.currentStock - (expired.get(String(item._id)) || 0))
-        + (pending.get(String(item._id)) || 0) < item.minStockThreshold
-    )).map((item) => {
+    const data = items.filter((item) => {
+      const threshold = Number(item.reorderLevel) > 0
+        ? Number(item.reorderLevel)
+        : Number(item.minStockThreshold || 0);
+      return Math.max(0, item.currentStock - (expired.get(String(item._id)) || 0))
+        + (pending.get(String(item._id)) || 0) < threshold;
+    }).map((item) => {
       const onOrder = pending.get(String(item._id)) || 0;
       const availableStock = Math.max(0, item.currentStock - (expired.get(String(item._id)) || 0));
-      const target = Math.max(item.reorderQuantity || 0, item.minStockThreshold - availableStock - onOrder);
-      const factor = getUnitConversionFactor(item, item.purchaseUnit || item.baseUnit || item.unit);
+      const threshold = Number(item.reorderLevel) > 0
+        ? Number(item.reorderLevel)
+        : Number(item.minStockThreshold || 0);
+      const target = Math.max(
+        threshold,
+        Number(item.maxStockLevel) > 0 ? Number(item.maxStockLevel) : Number(item.reorderQuantity || 0)
+      );
+      const activeSupportedUnits = (item.supportedUnits || []).filter((unit) => unit.isActive !== false);
+      const preferredUnitId = String(item.preferredPurchaseUnitId || item.purchaseUnitId || '');
+      const configuredPurchaseUnit = activeSupportedUnits.find((unit) => (
+        unit.isActive !== false
+        && String(unit.unitId?._id || unit.unitId || '') === preferredUnitId
+        && unit.isDefaultPurchaseUnit
+      )) || activeSupportedUnits.find((unit) => (
+        String(unit.unitId?._id || unit.unitId || '') === preferredUnitId
+      )) || activeSupportedUnits.find((unit) => unit.isDefaultPurchaseUnit);
+      const suggestedUnit = configuredPurchaseUnit?.unitSymbolSnapshot
+        || item.purchaseUnit
+        || item.baseUnit
+        || item.unit;
+      const factor = Number(configuredPurchaseUnit?.conversionFactorToBase)
+        || getUnitConversionFactor(item, suggestedUnit);
+      const suggestedBaseQuantity = Math.max(0, target - availableStock - onOrder);
       return {
         ...item,
         availableStock,
         pendingPurchaseQuantity: onOrder,
-        suggestedBaseQuantity: Math.max(0, target),
-        suggestedQuantity: Math.ceil(Math.max(0, target) / factor),
-        suggestedUnit: item.purchaseUnit || item.baseUnit || item.unit
+        suggestedBaseQuantity,
+        suggestedQuantity: Math.ceil(suggestedBaseQuantity / factor),
+        suggestedUnit
       };
     });
     res.json({ success: true, data });
@@ -1085,8 +1141,9 @@ export const getRecipes = async (req, res, next) => {
       String(batch._id),
       batch.quantity > 0 ? batch.value / batch.quantity : 0
     ]));
+    const roundMoney = (amount) => Math.round((amount + Number.EPSILON) * 100) / 100;
     const data = recipes.map((recipe) => {
-      const estimatedRecipeCost = recipe.ingredients.reduce((total, ingredient) => {
+      const ingredientCostPerRecipe = recipe.ingredients.reduce((total, ingredient) => {
         if (ingredient.optional) return total;
         const item = ingredient.itemId;
         const baseUnitCost = unitCosts.get(String(item?._id)) ?? Number(item?.unitCost || 0);
@@ -1094,12 +1151,22 @@ export const getRecipes = async (req, res, next) => {
           * Number(ingredient.conversionFactor || 1) * baseUnitCost;
       }, 0);
       const sellingPrice = Number(recipe.menuItemId?.price || 0);
+      const expectedProductionYield = Math.max(Number(recipe.expectedProductionYield) || 1, 0.00000001);
+      const expectedPreparationLossPercent = Number(recipe.expectedPreparationLossPercent) || 0;
+      const estimatedCostForYield = ingredientCostPerRecipe * (1 + expectedPreparationLossPercent / 100);
+      const estimatedRecipeCost = roundMoney(estimatedCostForYield / expectedProductionYield);
+      const estimatedGrossProfit = roundMoney(sellingPrice - estimatedRecipeCost);
       return {
         ...recipe,
         estimatedRecipeCost,
         costPerServing: estimatedRecipeCost,
         sellingPrice,
-        estimatedGrossProfit: sellingPrice - estimatedRecipeCost,
+        expectedProductionYield,
+        expectedPreparationLossPercent,
+        estimatedGrossProfit,
+        estimatedProfitWhole: roundMoney(
+          sellingPrice * expectedProductionYield - estimatedCostForYield
+        ),
         foodCostPercent: sellingPrice > 0
           ? Math.round((estimatedRecipeCost / sellingPrice) * 10000) / 100
           : null
@@ -1118,13 +1185,19 @@ export const saveRecipe = async (req, res, next) => {
     }
     const {
       menuItemId, ingredients, recipeName = '', description = '',
-      servingSize = '1 serving', preparationTimeMinutes = 0
+      servingSize = '1 serving', preparationTimeMinutes = 0,
+      productionMode = 'made_to_order', expectedProductionYield = 1,
+      expectedPreparationLossPercent = 0
     } = req.body;
     if (!mongoose.isValidObjectId(menuItemId) || !Array.isArray(ingredients) || !ingredients.length) {
       return res.status(400).json({ success: false, message: 'Menu item and at least one ingredient are required.' });
     }
     if (!Number.isFinite(Number(preparationTimeMinutes)) || Number(preparationTimeMinutes) < 0
-      || (typeof servingSize !== 'string' && typeof servingSize !== 'number')) {
+      || (typeof servingSize !== 'string' && typeof servingSize !== 'number')
+      || !['made_to_order', 'batch_production'].includes(productionMode)
+      || !Number.isFinite(Number(expectedProductionYield)) || Number(expectedProductionYield) <= 0
+      || !Number.isFinite(Number(expectedPreparationLossPercent))
+      || Number(expectedPreparationLossPercent) < 0 || Number(expectedPreparationLossPercent) > 100) {
       return res.status(400).json({ success: false, message: 'Serving size and preparation time are invalid.' });
     }
     const MenuItem = mongoose.model('MenuItem');
@@ -1177,6 +1250,9 @@ export const saveRecipe = async (req, res, next) => {
         description: String(description).trim(),
         servingSize: String(servingSize).trim() || '1 serving',
         preparationTimeMinutes: Number(preparationTimeMinutes),
+        expectedProductionYield: Number(expectedProductionYield),
+        expectedPreparationLossPercent: Number(expectedPreparationLossPercent),
+        productionMode,
         ingredients: ingredients.map((ingredient) => ({
           itemId: ingredient.itemId,
           quantity: Number(ingredient.quantity),

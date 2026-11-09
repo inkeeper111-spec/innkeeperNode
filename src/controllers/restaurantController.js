@@ -1,5 +1,6 @@
 import {
-  MenuCategory, MenuItem, FoodOrder, Reservation, Invoice, Room, RestaurantTable, Property, InventorySettings
+  MenuCategory, MenuItem, FoodOrder, Reservation, Invoice, Room, RestaurantTable, Property,
+  InventoryRecipe, ProductionBatch, InventorySettings, PreparedFoodMovement
 } from '../models/index.js';
 import { FOOD_ORDER_STATUS, RESERVATION_STATUS } from '../config/constants.js';
 import { generateReference } from '../utils/reference.js';
@@ -8,7 +9,8 @@ import { formatCurrency } from '../utils/currency.js';
 import mongoose from 'mongoose';
 import { notifyRoles } from '../services/notificationService.js';
 import {
-  consumeRecipesForOrder, reverseRecipeConsumptionForOrder, runInventoryTransaction
+  consumePreparedFoodForOrder, consumeRecipesForOrder, releasePreparedFoodReservationsForOrder,
+  reservePreparedFoodForOrder, reverseRecipeConsumptionForOrder, runInventoryTransaction
 } from '../services/inventoryService.js';
 
 const resolveRestaurantProperty = async (req, res) => {
@@ -168,6 +170,8 @@ export const updateTable = async (req, res, next) => {
 
 export const getMenu = async (req, res, next) => {
   try {
+    const propertyId = req.propertyId || req.user?.propertyId
+      || (req.user?.role === 'super_admin' ? req.query.propertyId : null);
     const includeUnavailable = req.query.includeUnavailable === 'true';
     if (includeUnavailable && !['hotel_admin', 'super_admin'].includes(req.user.role)) {
       return res.status(403).json({
@@ -179,13 +183,44 @@ export const getMenu = async (req, res, next) => {
     const categories = await MenuCategory.find({ hotelId: req.hotelId, isActive: true }).sort({ displayOrder: 1 });
     const itemFilter = { hotelId: req.hotelId };
     if (!includeUnavailable) itemFilter.isAvailable = true;
-    const items = await MenuItem.find(itemFilter).populate('categoryId');
+    const items = await MenuItem.find(itemFilter).populate('categoryId').lean();
+    const batchRecipes = mongoose.isValidObjectId(propertyId) ? await InventoryRecipe.find({
+      hotelId: req.hotelId,
+      propertyId,
+      menuItemId: { $in: items.map((item) => item._id) },
+      isActive: true,
+      productionMode: 'batch_production'
+    }).select('menuItemId').lean() : [];
+    const batchItemIds = batchRecipes.map((recipe) => recipe.menuItemId);
+    const portionAvailability = batchItemIds.length ? await ProductionBatch.aggregate([
+      {
+        $match: {
+          hotelId: req.hotelId,
+          propertyId,
+          menuItemId: { $in: batchItemIds },
+          status: 'active',
+          availableQuantity: { $gt: 0 },
+          $or: [{ expiryDate: null }, { expiryDate: { $gt: new Date() } }]
+        }
+      },
+      { $group: { _id: '$menuItemId', availablePreparedPortions: { $sum: '$availableQuantity' } } }
+    ]) : [];
+    const availableByMenuItem = new Map(portionAvailability.map((entry) => [
+      String(entry._id),
+      Number(entry.availablePreparedPortions || 0)
+    ]));
+    const batchItemIdSet = new Set(batchItemIds.map(String));
+    const menuItems = items.map((item) => ({
+      ...item,
+      fulfillmentSource: batchItemIdSet.has(String(item._id)) ? 'batch_production' : 'made_to_order',
+      availablePreparedPortions: availableByMenuItem.get(String(item._id)) || 0
+    }));
 
     res.json({
       success: true,
       data: {
         categories,
-        items
+        items: menuItems
       }
     });
   } catch (err) {
@@ -355,74 +390,87 @@ export const restoreArchivedBill = async (req, res, next) => {
 };
 
 const appendItemsToOpenTableOrder = async ({ req, propertyId, table, orderItems }) => {
-  const existing = await FoodOrder.findOne({
-    _id: table.activeOrderId,
-    hotelId: req.hotelId,
-    propertyId,
-    tableId: table._id,
-    orderType: 'dine_in',
-    paymentStatus: 'unpaid',
-    status: { $ne: FOOD_ORDER_STATUS.CANCELLED }
+  const result = await runInventoryTransaction(async (session) => {
+    const existing = await FoodOrder.findOne({
+      _id: table.activeOrderId,
+      hotelId: req.hotelId,
+      propertyId,
+      tableId: table._id,
+      orderType: 'dine_in',
+      paymentStatus: 'unpaid',
+      status: { $ne: FOOD_ORDER_STATUS.CANCELLED }
+    }).session(session);
+    if (!existing) {
+      return {
+        error: {
+          status: 409,
+          message: 'This table bill is already closed. Refresh and choose the table again.'
+        }
+      };
+    }
+
+    const startLineIndex = existing.items.length;
+    const items = [...existing.items.map((item) => item.toObject()), ...orderItems];
+    const subtotal = Math.round(items.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+    const taxAmount = Math.round(subtotal * 0.05 * 100) / 100;
+    const totalAmount = Math.round((subtotal - (existing.discountAmount || 0) + taxAmount) * 100) / 100;
+    const nextStatus = existing.status === FOOD_ORDER_STATUS.SERVED
+      ? FOOD_ORDER_STATUS.PENDING
+      : existing.status;
+
+    const updated = await FoodOrder.findOneAndUpdate({
+      _id: existing._id,
+      hotelId: req.hotelId,
+      propertyId,
+      paymentStatus: 'unpaid',
+      status: existing.status,
+      $expr: { $eq: [{ $size: '$items' }, existing.items.length] }
+    }, {
+      $set: {
+        items,
+        subtotal,
+        taxAmount,
+        totalAmount,
+        status: nextStatus,
+        preparedFoodDeductedAt: null
+      }
+    }, { new: true, session });
+
+    if (!updated) {
+      return {
+        error: {
+          status: 409,
+          message: 'This table order changed. Refresh and add the items again.'
+        }
+      };
+    }
+    await reservePreparedFoodForOrder(updated, session, req.user._id, startLineIndex);
+    await updated.save({ session });
+    return { order: updated };
   });
-  if (!existing) {
-    return {
-      error: {
-        status: 409,
-        message: 'This table bill is already closed. Refresh and choose the table again.'
-      }
-    };
-  }
-
-  const items = [
-    ...existing.items.map((item) => item.toObject()),
-    ...orderItems
-  ];
-  const subtotal = Math.round(items.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
-  const taxAmount = Math.round(subtotal * 0.05 * 100) / 100;
-  const totalAmount = Math.round((subtotal - (existing.discountAmount || 0) + taxAmount) * 100) / 100;
-  const nextStatus = existing.status === FOOD_ORDER_STATUS.SERVED
-    ? FOOD_ORDER_STATUS.PENDING
-    : existing.status;
-
-  const updated = await FoodOrder.findOneAndUpdate({
-    _id: existing._id,
-    hotelId: req.hotelId,
-    propertyId,
-    paymentStatus: 'unpaid',
-    status: existing.status,
-    $expr: { $eq: [{ $size: '$items' }, existing.items.length] }
-  }, {
-    $set: { items, subtotal, taxAmount, totalAmount, status: nextStatus }
-  }, { new: true });
-
-  if (!updated) {
-    return {
-      error: {
-        status: 409,
-        message: 'This table order changed. Refresh and add the items again.'
-      }
-    };
-  }
+  if (result.error) return result;
+  const { order } = result;
 
   await notifyRoles({
     hotelId: req.hotelId,
     roles: ['restaurant_staff'],
     title: 'Items added to a table',
-    message: `More items were added to ${updated.tableNumber || `Table ${table.tableNumber}`} (${updated.orderNumber}).`,
+    message: `More items were added to ${order.tableNumber || `Table ${table.tableNumber}`} (${order.orderNumber}).`,
     module: 'restaurant',
     eventType: 'restaurant_order_items_added',
-    relatedRecordId: updated._id,
+    relatedRecordId: order._id,
     priority: 'medium',
     link: '/restaurant',
-    eventId: `restaurant-order-items-added:${updated._id}:${updated.items.length}`
+    eventId: `restaurant-order-items-added:${order._id}:${order.items.length}`
   });
 
-  return { order: updated };
+  return { order };
 };
 
 export const createOrder = async (req, res, next) => {
   let lockedTableId = null;
   let activeOrderId = null;
+  let createdOrderId = null;
   try {
     const propertyId = await resolveRestaurantProperty(req, res);
     if (!propertyId) return;
@@ -450,6 +498,14 @@ export const createOrder = async (req, res, next) => {
 
     let subtotal = 0;
     const orderItems = [];
+    const batchRecipes = await InventoryRecipe.find({
+      hotelId: req.hotelId,
+      propertyId,
+      menuItemId: { $in: items.map((item) => item.menuItemId).filter(mongoose.isValidObjectId) },
+      isActive: true,
+      productionMode: 'batch_production'
+    }).select('menuItemId').lean();
+    const batchRecipeMenuItemIds = new Set(batchRecipes.map((recipe) => String(recipe.menuItemId)));
 
     for (const item of items) {
       const menuItem = await MenuItem.findOne({ _id: item.menuItemId, hotelId: req.hotelId });
@@ -466,6 +522,9 @@ export const createOrder = async (req, res, next) => {
         quantity: item.quantity,
         unitPrice: menuItem.price,
         amount: itemTotal,
+        fulfillmentSource: batchRecipeMenuItemIds.has(String(menuItem._id))
+          ? 'batch_production'
+          : 'made_to_order',
         specialInstructions: item.specialInstructions || '',
         ingredientSubstitutions: item.ingredientSubstitutions || []
       });
@@ -560,7 +619,7 @@ export const createOrder = async (req, res, next) => {
     }
 
     const orderNumber = generateReference('ORD');
-    const order = await FoodOrder.create({
+    let order = await FoodOrder.create({
       _id: activeOrderId || new mongoose.Types.ObjectId(),
       hotelId: req.hotelId,
       propertyId,
@@ -583,6 +642,19 @@ export const createOrder = async (req, res, next) => {
       paymentStatus: 'unpaid',
       createdBy: req.user._id
     });
+    createdOrderId = order._id;
+    order = await runInventoryTransaction(async (session) => {
+      const current = await FoodOrder.findOne({
+        _id: order._id,
+        hotelId: req.hotelId,
+        propertyId
+      }).session(session);
+      if (!current) throw Object.assign(new Error('Restaurant order could not be reloaded for stock reservation.'), { statusCode: 409 });
+      await reservePreparedFoodForOrder(current, session, req.user._id);
+      await current.save({ session });
+      return current;
+    });
+    createdOrderId = null;
     lockedTableId = null;
 
     await notifyRoles({
@@ -604,6 +676,9 @@ export const createOrder = async (req, res, next) => {
       data: order
     });
   } catch (err) {
+    if (createdOrderId) {
+      await FoodOrder.deleteOne({ _id: createdOrderId, hotelId: req.hotelId });
+    }
     if (lockedTableId && activeOrderId) {
       await RestaurantTable.updateOne(
         { _id: lockedTableId, activeOrderId },
@@ -650,7 +725,11 @@ export const updateOrderStatus = async (req, res, next) => {
       if (status === deductionStatus) {
         await consumeRecipesForOrder(order, session, { skipEmpty: true, recordedBy: req.user._id });
       }
+      if (status === FOOD_ORDER_STATUS.SERVED) {
+        await consumePreparedFoodForOrder(order, session, req.user._id);
+      }
       if (status === FOOD_ORDER_STATUS.CANCELLED) {
+        await releasePreparedFoodReservationsForOrder(order, session, req.user._id);
         await reverseRecipeConsumptionForOrder(order, session, req.user._id);
       }
 
@@ -812,6 +891,21 @@ export const settleOrder = async (req, res, next) => {
       current.paymentMethod = req.body.paymentMethod || 'cash';
       await current.save({ session });
       await consumeRecipesForOrder(current, session);
+      const preparedFoodSales = await PreparedFoodMovement.find({
+        hotelId: req.hotelId,
+        propertyId,
+        orderId: current._id,
+        movementType: 'sale'
+      }).session(session);
+      for (const movement of preparedFoodSales) {
+        if (!Number.isInteger(movement.orderLineIndex)) continue;
+        const orderLine = current.items[movement.orderLineIndex];
+        if (!orderLine) {
+          throw Object.assign(new Error('A prepared-food sale is missing its restaurant order line.'), { statusCode: 409 });
+        }
+        movement.salesRevenue = Math.round(movement.quantity * Number(orderLine.unitPrice || 0) * 100) / 100;
+        await movement.save({ session });
+      }
       if (current.tableId) {
         await RestaurantTable.updateOne(
           { _id: current.tableId, hotelId: req.hotelId, propertyId, activeOrderId: current._id },

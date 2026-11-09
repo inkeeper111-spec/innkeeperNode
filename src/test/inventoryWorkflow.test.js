@@ -1,18 +1,18 @@
 import mongoose from 'mongoose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  createStockAdjustment, createStockVerification, getInventoryReport, getReorderSuggestions, getStockAdjustments,
-  getStockLocations
+  approvePurchaseOrder, createStockAdjustment, createStockVerification, getInventoryReport, getReorderSuggestions,
+  getStockAdjustments, getStockLocations
 } from '../controllers/inventoryAdvancedController.js';
-import { getInventoryBatches } from '../controllers/inventoryController.js';
+import { getInventoryBatches, receivePurchaseOrderGoods, reviewAutomaticReorder } from '../controllers/inventoryController.js';
 import {
-  AuditLog, FoodOrder, Hotel, InventoryBalance, InventoryBatch, InventoryItem, RecipeConsumption,
+  AuditLog, FoodOrder, Hotel, InventoryBalance, InventoryBatch, InventoryItem, PurchaseOrder, RecipeConsumption, Vendor,
   StockAdjustment, StockMovement, StockReceiptRequest, StockVerification
 } from '../models/index.js';
 import {
   createStockReceiptRequest, recordStockMovement, reviewStockReceiptRequest
 } from '../controllers/inventoryController.js';
-import { postStockMovement, runInventoryTransaction } from '../services/inventoryService.js';
+import { postStockMovement, runInventoryTransaction, transferStock } from '../services/inventoryService.js';
 import { setup, teardown } from './setup.js';
 
 const hotelId = new mongoose.Types.ObjectId();
@@ -67,9 +67,82 @@ const createItem = () => InventoryItem.create({
   unitCost: 60
 });
 
+const createReorderItem = ({
+  currentStock = 0,
+  isolatedHotelId = hotelId,
+  isolatedPropertyId = propertyId
+} = {}) => InventoryItem.create({
+  hotelId: isolatedHotelId,
+  propertyId: isolatedPropertyId,
+  name: `Automatic reorder item ${new mongoose.Types.ObjectId()}`,
+  code: new mongoose.Types.ObjectId().toString().slice(-8),
+  inventoryType: 'raw_material',
+  unit: 'kg',
+  baseUnit: 'kg',
+  purchaseUnit: 'kg',
+  purchaseConversionFactor: 1,
+  currentStock,
+  minStockThreshold: 5,
+  reorderLevel: 5,
+  reorderQuantity: 5,
+  maxStockLevel: 20,
+  unitCost: 2
+});
+
 describe('raw material inventory workflow', () => {
   beforeAll(async () => setup());
   afterAll(async () => teardown());
+
+  it('transfers raw-material batches and balance between departments', async () => {
+    const isolatedHotelId = new mongoose.Types.ObjectId();
+    const isolatedPropertyId = new mongoose.Types.ObjectId();
+    const item = await InventoryItem.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      name: `Department transfer item ${new mongoose.Types.ObjectId()}`,
+      code: new mongoose.Types.ObjectId().toString().slice(-8),
+      unit: 'kg',
+      baseUnit: 'kg',
+      purchaseUnit: 'kg',
+      currentStock: 10,
+      minStockThreshold: 0,
+      unitCost: 60
+    });
+    await InventoryBalance.create({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      location: 'Kitchen Store',
+      quantity: 10
+    });
+
+    const transfer = await runInventoryTransaction((session) => transferStock({
+      hotelId: isolatedHotelId,
+      propertyId: isolatedPropertyId,
+      itemId: item._id,
+      quantity: 4,
+      unit: 'kg',
+      transferMode: 'department',
+      fromDepartment: 'Kitchen',
+      toDepartment: 'Restaurant',
+      recordedBy: actorId,
+      referenceNumber: 'DEPARTMENT-TRANSFER-TEST',
+      idempotencyKey: 'department-transfer-test',
+      session
+    }));
+
+    expect(transfer.duplicate).toBe(false);
+    expect(await InventoryBalance.findOne({ itemId: item._id, location: 'Kitchen Store' }).then((balance) => balance.quantity)).toBe(6);
+    expect(await InventoryBalance.findOne({ itemId: item._id, location: 'Restaurant Store' }).then((balance) => balance.quantity)).toBe(4);
+    const movements = await StockMovement.find({ itemId: item._id, referenceNumber: 'DEPARTMENT-TRANSFER-TEST' }).sort({ location: 1 });
+    expect(movements).toHaveLength(2);
+    expect(movements.map((movement) => movement.department).sort()).toEqual(['Kitchen', 'Restaurant']);
+    expect(movements[0]).toMatchObject({
+      sourceDepartment: 'Kitchen',
+      destinationDepartment: 'Restaurant'
+    });
+    expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(10);
+  });
 
   it('lists only below-threshold stock with a purchase quantity suggestion', async () => {
     const isolatedHotelId = new mongoose.Types.ObjectId();
@@ -93,7 +166,6 @@ describe('raw material inventory workflow', () => {
       propertyId: isolatedPropertyId,
       query: {}
     });
-
     expect(response.body.data).toHaveLength(1);
     expect(response.body.data[0]).toMatchObject({
       _id: lowItem._id,
@@ -103,6 +175,150 @@ describe('raw material inventory workflow', () => {
       suggestedUnit: 'kg'
     });
   });
+
+    it('creates and updates one pending-review requirement using desired stock without changing inventory', async () => {
+      const isolatedHotelId = new mongoose.Types.ObjectId();
+      const isolatedPropertyId = new mongoose.Types.ObjectId();
+      const item = await createReorderItem({ currentStock: 6, isolatedHotelId, isolatedPropertyId });
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        movementType: 'issue',
+        quantity: 2,
+        unit: 'kg',
+        department: 'Kitchen',
+        referenceNumber: 'AUTO-REORDER-FIRST-ISSUE',
+        session
+      }));
+
+      let orders = await PurchaseOrder.find({ autoReorderItemId: item._id });
+      expect(orders).toHaveLength(1);
+      expect(orders[0]).toMatchObject({
+        status: 'draft',
+        autoGenerated: true,
+        vendorId: null
+      });
+      expect(orders[0].items[0].quantity).toBe(16);
+      expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(4);
+
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        movementType: 'issue',
+        quantity: 1,
+        unit: 'kg',
+        department: 'Kitchen',
+        referenceNumber: 'AUTO-REORDER-SECOND-ISSUE',
+        session
+      }));
+
+      orders = await PurchaseOrder.find({ autoReorderItemId: item._id });
+      expect(orders).toHaveLength(1);
+      expect(orders[0].items[0].quantity).toBe(17);
+      expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(3);
+    });
+
+    it('cancels an unreviewed reorder requirement when restored stock rises above the threshold', async () => {
+      const isolatedHotelId = new mongoose.Types.ObjectId();
+      const isolatedPropertyId = new mongoose.Types.ObjectId();
+      const item = await createReorderItem({ currentStock: 4, isolatedHotelId, isolatedPropertyId });
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        movementType: 'issue',
+        quantity: 1,
+        unit: 'kg',
+        department: 'Kitchen',
+        referenceNumber: 'AUTO-REORDER-RESTORE-ISSUE',
+        session
+      }));
+      const requirement = await PurchaseOrder.findOne({ autoReorderItemId: item._id });
+      expect(requirement).toBeTruthy();
+
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        movementType: 'return',
+        quantity: 3,
+        unit: 'kg',
+        referenceNumber: 'AUTO-REORDER-RESTORE',
+        session
+      }));
+
+      const cancelled = await PurchaseOrder.findById(requirement._id);
+      expect(cancelled.status).toBe('cancelled');
+      expect(cancelled.autoReorderItemId).toBeNull();
+      expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBe(6);
+    });
+
+    it('accounts for partial goods receipts and requires supplier review before approval', async () => {
+      const isolatedHotelId = new mongoose.Types.ObjectId();
+      const isolatedPropertyId = new mongoose.Types.ObjectId();
+      const item = await createReorderItem({ currentStock: 4, isolatedHotelId, isolatedPropertyId });
+      await runInventoryTransaction((session) => postStockMovement({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        itemId: item._id,
+        movementType: 'issue',
+        quantity: 0.1,
+        unit: 'kg',
+        department: 'Kitchen',
+        referenceNumber: 'AUTO-REORDER-PARTIAL-ISSUE',
+        session
+      }));
+      const requirement = await PurchaseOrder.findOne({ autoReorderItemId: item._id });
+      const vendor = await Vendor.create({
+        hotelId: isolatedHotelId,
+        name: 'Reorder test supplier',
+        phone: '1234567890'
+      });
+      const req = {
+        ...requestFor({ vendorId: String(vendor._id), quantity: requirement.items[0].quantity }),
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        params: { id: String(requirement._id) },
+        user: { _id: actorId, role: 'hotel_admin', name: 'Inventory manager' }
+      };
+
+      const review = await invoke(reviewAutomaticReorder, req);
+      expect(review.statusCode).toBe(200);
+      expect(review.body.data.status).toBe('pending_approval');
+      const approved = await invoke(approvePurchaseOrder, {
+        ...req,
+        body: {}
+      });
+      expect(approved.statusCode).toBe(200);
+      expect(approved.body.data.status).toBe('ordered');
+
+      const receipt = await invoke(receivePurchaseOrderGoods, {
+        ...req,
+        body: {
+          items: [{
+            itemId: String(item._id),
+            receivedQuantity: 5,
+            acceptedQuantity: 4,
+            damagedQuantity: 1,
+            rejectedQuantity: 0
+          }]
+        }
+      });
+      expect(receipt.statusCode).toBe(200);
+      expect(await InventoryItem.findById(item._id).then((entry) => entry.currentStock)).toBeCloseTo(7.9);
+      const partiallyReceived = await PurchaseOrder.findById(requirement._id);
+      expect(partiallyReceived.status).toBe('partially_received');
+      expect(partiallyReceived.items[0].receivedQuantity).toBe(5);
+      expect(await PurchaseOrder.countDocuments({ autoReorderItemId: item._id })).toBe(0);
+      expect(await PurchaseOrder.countDocuments({
+        hotelId: isolatedHotelId,
+        propertyId: isolatedPropertyId,
+        'items.itemId': item._id,
+        status: { $in: ['ordered', 'partially_received'] }
+      })).toBe(1);
+    });
 
   it('does not show stock without a recorded batch as a batch entry', async () => {
     const isolatedHotelId = new mongoose.Types.ObjectId();

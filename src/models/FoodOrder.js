@@ -24,6 +24,11 @@ const orderItemSchema = new mongoose.Schema({
     type: Number,
     required: true
   },
+  fulfillmentSource: {
+    type: String,
+    enum: ['made_to_order', 'batch_production'],
+    default: 'made_to_order'
+  },
   specialInstructions: {
     type: String,
     default: ''
@@ -34,6 +39,14 @@ const orderItemSchema = new mongoose.Schema({
     quantity: { type: Number, min: 0.000001 },
     unit: { type: String, trim: true }
   }]
+}, { _id: false });
+
+const preparedFoodAllocationSchema = new mongoose.Schema({
+  menuItemId: { type: mongoose.Schema.Types.ObjectId, ref: 'MenuItem', required: true },
+  productionBatchId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductionBatch', required: true },
+  quantity: { type: Number, required: true, min: 0.00000001 },
+  orderLineIndex: { type: Number, min: 0, default: 0 },
+  status: { type: String, enum: ['reserved', 'sold', 'released', 'reversed'], default: 'reserved' }
 }, { _id: false });
 
 const amountModificationSchema = new mongoose.Schema({
@@ -104,6 +117,9 @@ const foodOrderSchema = new mongoose.Schema({
   },
   guestName: String,
   items: [orderItemSchema],
+  preparedFoodAllocations: { type: [preparedFoodAllocationSchema], default: [] },
+  preparedFoodReservedAt: { type: Date, default: null },
+  preparedFoodDeductedAt: { type: Date, default: null },
   subtotal: {
     type: Number,
     required: true,

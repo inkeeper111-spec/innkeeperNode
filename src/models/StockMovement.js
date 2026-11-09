@@ -73,6 +73,8 @@ const stockMovementSchema = new mongoose.Schema({
   location: { type: String, trim: true, default: 'Main Store' },
   destinationLocation: { type: String, trim: true, default: '' },
   department: { type: String, trim: true, default: '' },
+  sourceDepartment: { type: String, trim: true, default: '' },
+  destinationDepartment: { type: String, trim: true, default: '' },
   vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor', default: null },
   purchaseUnitPrice: { type: Number, min: 0, default: null },
   idempotencyKey: { type: String, default: undefined },
