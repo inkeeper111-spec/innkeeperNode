@@ -1122,7 +1122,7 @@ export const getRecipes = async (req, res, next) => {
     if (req.query.menuItemId) filter.menuItemId = req.query.menuItemId;
     const recipes = await InventoryRecipe.find(filter)
       .populate('menuItemId', 'name price')
-      .populate('ingredients.itemId', 'name code unit baseUnit unitCost')
+      .populate('ingredients.itemId', 'name code unit baseUnit unitCost purchasePrice purchaseConversionFactor')
       .populate('ingredients.substitutions.itemId', 'name code unit baseUnit')
       .sort({ menuItemId: 1, version: -1 })
       .lean();
@@ -1139,35 +1139,83 @@ export const getRecipes = async (req, res, next) => {
     ]) : [];
     const unitCosts = new Map(batchCosts.map((batch) => [
       String(batch._id),
-      batch.quantity > 0 ? batch.value / batch.quantity : 0
+      batch.quantity > 0 ? batch.value / batch.quantity : null
     ]));
     const roundMoney = (amount) => Math.round((amount + Number.EPSILON) * 100) / 100;
     const data = recipes.map((recipe) => {
-      const ingredientCostPerRecipe = recipe.ingredients.reduce((total, ingredient) => {
-        if (ingredient.optional) return total;
+      let totalRecipeCost = 0;
+      let ingredientCostPending = false;
+      recipe.ingredients.forEach((ingredient) => {
+        if (ingredient.optional) return;
         const item = ingredient.itemId;
-        const baseUnitCost = unitCosts.get(String(item?._id)) ?? Number(item?.unitCost || 0);
-        return total + Number(ingredient.quantity || 0)
-          * Number(ingredient.conversionFactor || 1) * baseUnitCost;
-      }, 0);
-      const sellingPrice = Number(recipe.menuItemId?.price || 0);
-      const expectedProductionYield = Math.max(Number(recipe.expectedProductionYield) || 1, 0.00000001);
+        const quantity = Number(ingredient.quantity);
+        const conversionFactor = Number(ingredient.conversionFactor || 1);
+        const itemId = String(item?._id);
+        const purchasePrice = item?.purchasePrice;
+        const purchaseConversionFactor = Number(item?.purchaseConversionFactor);
+        const purchaseUnitCost = purchasePrice !== null && purchasePrice !== undefined
+          && Number.isFinite(Number(purchasePrice))
+          && Number.isFinite(purchaseConversionFactor)
+          && purchaseConversionFactor > 0
+          ? Number(purchasePrice) / purchaseConversionFactor
+          : null;
+        const storedUnitCost = Number(item?.unitCost);
+        const baseUnitCost = unitCosts.has(itemId)
+          ? unitCosts.get(itemId)
+          : purchaseUnitCost ?? (
+            Number.isFinite(storedUnitCost) && storedUnitCost > 0 ? storedUnitCost : null
+          );
+        if (!Number.isFinite(quantity) || quantity <= 0
+          || !Number.isFinite(conversionFactor) || conversionFactor <= 0
+          || baseUnitCost === null || !Number.isFinite(baseUnitCost)) {
+          ingredientCostPending = true;
+          return;
+        }
+        totalRecipeCost += quantity * conversionFactor * baseUnitCost;
+      });
+      const hasSellingPrice = recipe.menuItemId?.price !== null
+        && recipe.menuItemId?.price !== undefined
+        && recipe.menuItemId?.price !== '';
+      const sellingPrice = hasSellingPrice && Number.isFinite(Number(recipe.menuItemId.price))
+        ? Number(recipe.menuItemId.price)
+        : null;
+      const expectedProductionYield = recipe.expectedProductionYield === null
+        || recipe.expectedProductionYield === undefined
+        || recipe.expectedProductionYield === ''
+        ? null
+        : Number(recipe.expectedProductionYield);
+      const validYield = Number.isFinite(expectedProductionYield) && expectedProductionYield > 0;
       const expectedPreparationLossPercent = Number(recipe.expectedPreparationLossPercent) || 0;
-      const estimatedCostForYield = ingredientCostPerRecipe * (1 + expectedPreparationLossPercent / 100);
-      const estimatedRecipeCost = roundMoney(estimatedCostForYield / expectedProductionYield);
-      const estimatedGrossProfit = roundMoney(sellingPrice - estimatedRecipeCost);
+      const expectedPreparationLossQuantity = validYield
+        ? expectedProductionYield * expectedPreparationLossPercent / 100
+        : null;
+      const expectedUsableQuantity = validYield
+        ? expectedProductionYield - expectedPreparationLossQuantity
+        : null;
+      const totalCost = ingredientCostPending ? null : roundMoney(totalRecipeCost);
+      const validUsableYield = Number.isFinite(expectedUsableQuantity) && expectedUsableQuantity > 0;
+      const estimatedRecipeCost = totalCost !== null && validUsableYield
+        ? roundMoney(totalCost / expectedUsableQuantity)
+        : null;
+      const estimatedGrossProfit = estimatedRecipeCost !== null && sellingPrice !== null
+        ? roundMoney(sellingPrice - estimatedRecipeCost)
+        : null;
       return {
         ...recipe,
+        totalRecipeCost: totalCost,
         estimatedRecipeCost,
         costPerServing: estimatedRecipeCost,
         sellingPrice,
         expectedProductionYield,
         expectedPreparationLossPercent,
+        expectedPreparationLossQuantity,
+        expectedUsableQuantity,
+        costPending: ingredientCostPending,
         estimatedGrossProfit,
-        estimatedProfitWhole: roundMoney(
-          sellingPrice * expectedProductionYield - estimatedCostForYield
-        ),
-        foodCostPercent: sellingPrice > 0
+        estimatedProfitWhole: totalCost !== null && validUsableYield && sellingPrice !== null
+          ? roundMoney(sellingPrice * expectedUsableQuantity - totalCost)
+          : null,
+        foodCostPercent: estimatedRecipeCost !== null && sellingPrice > 0
           ? Math.round((estimatedRecipeCost / sellingPrice) * 10000) / 100
           : null
       };

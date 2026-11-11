@@ -124,10 +124,13 @@ describe('recipe-based inventory management', () => {
       servingSize: '1 plate',
       preparationTimeMinutes: 12,
       estimatedRecipeCost: 0.33,
+      totalRecipeCost: 0.33,
       sellingPrice: 5,
       estimatedGrossProfit: 4.67,
       estimatedProfitWhole: 4.67,
       expectedProductionYield: 1,
+      expectedPreparationLossQuantity: 0,
+      expectedUsableQuantity: 1,
       expectedPreparationLossPercent: 0,
       foodCostPercent: 6.6
     });
@@ -157,11 +160,14 @@ describe('recipe-based inventory management', () => {
     );
     expect(bulkRecipe).toMatchObject({
       estimatedRecipeCost: 0.12,
+      totalRecipeCost: 0.33,
       sellingPrice: 5,
       expectedProductionYield: 3,
+      expectedPreparationLossQuantity: 0.3,
+      expectedUsableQuantity: 2.7,
       expectedPreparationLossPercent: 10,
       estimatedGrossProfit: 4.88,
-      estimatedProfitWhole: 14.64
+      estimatedProfitWhole: 13.17
     });
 
     const order = await FoodOrder.create({
@@ -753,6 +759,161 @@ describe('recipe-based inventory management', () => {
       transferredOutQuantity: 4,
       wastedQuantity: 2,
       availableQuantity: 14
+    });
+  });
+
+  it('calculates full-recipe costs from purchase prices and inventory batches, and reports missing costs as pending', async () => {
+    const property = await Property.create({
+      hotelId,
+      name: 'Recipe Cost Test Property',
+      code: `RCT${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      address: '2 Test Road',
+      city: 'Test City',
+      state: 'Test State',
+      phone: '5551234568'
+    });
+    const category = await MenuCategory.create({ hotelId, name: 'Recipe Cost Tests' });
+    const menuItem = await MenuItem.create({
+      hotelId,
+      categoryId: category._id,
+      name: 'Costed Recipe Test Dish',
+      price: 20
+    });
+    const purchasePriceIngredient = await InventoryItem.create({
+      hotelId,
+      propertyId: property._id,
+      name: 'Purchase Price Ingredient',
+      code: `PPI${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      inventoryType: 'raw_material',
+      unit: 'g',
+      baseUnit: 'g',
+      currentStock: 0,
+      purchasePrice: 40,
+      purchaseConversionFactor: 4,
+      unitCost: 0
+    });
+    const batchCostIngredient = await InventoryItem.create({
+      hotelId,
+      propertyId: property._id,
+      name: 'Batch Cost Ingredient',
+      code: `BCI${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      inventoryType: 'raw_material',
+      unit: 'g',
+      baseUnit: 'g',
+      currentStock: 0,
+      unitCost: 0
+    });
+    await InventoryBatch.create([
+      {
+        hotelId, propertyId: property._id, itemId: batchCostIngredient._id,
+        location: 'Main Store', quantity: 1, remainingQuantity: 1, unitCost: 6
+      },
+      {
+        hotelId, propertyId: property._id, itemId: batchCostIngredient._id,
+        location: 'Main Store', quantity: 3, remainingQuantity: 3, unitCost: 10
+      }
+    ]);
+
+    const recipeResponse = await invoke(saveRecipe, requestFor({
+      propertyId: property._id,
+      body: {
+        menuItemId: String(menuItem._id),
+        recipeName: 'Costed Recipe',
+        expectedProductionYield: 10,
+        expectedPreparationLossPercent: 20,
+        ingredients: [
+          { itemId: String(purchasePriceIngredient._id), quantity: 2, unit: 'g' },
+          { itemId: String(batchCostIngredient._id), quantity: 2, unit: 'g' }
+        ]
+      }
+    }));
+    expect(recipeResponse.statusCode).toBe(201);
+
+    const recipes = await invoke(getRecipes, requestFor({ propertyId: property._id }));
+    const recipe = recipes.body.data.find((entry) => String(entry._id) === String(recipeResponse.body.data._id));
+    expect(recipe).toMatchObject({
+      totalRecipeCost: 38,
+      estimatedRecipeCost: 4.75,
+      costPerServing: 4.75,
+      sellingPrice: 20,
+      expectedProductionYield: 10,
+      expectedPreparationLossPercent: 20,
+      expectedPreparationLossQuantity: 2,
+      expectedUsableQuantity: 8,
+      estimatedGrossProfit: 15.25,
+      estimatedProfitWhole: 122,
+      foodCostPercent: 23.75,
+      costPending: false
+    });
+
+    const unpricedMenuItem = await MenuItem.create({
+      hotelId,
+      categoryId: category._id,
+      name: 'Unpriced Recipe Test Dish',
+      price: 20
+    });
+    const unpricedIngredient = await InventoryItem.create({
+      hotelId,
+      propertyId: property._id,
+      name: 'Unpriced Ingredient',
+      code: `UPI${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      inventoryType: 'raw_material',
+      unit: 'g',
+      baseUnit: 'g',
+      currentStock: 0,
+      unitCost: 0,
+      purchasePrice: null
+    });
+    const unpricedRecipe = await invoke(saveRecipe, requestFor({
+      propertyId: property._id,
+      body: {
+        menuItemId: String(unpricedMenuItem._id),
+        ingredients: [{ itemId: String(unpricedIngredient._id), quantity: 1, unit: 'g' }]
+      }
+    }));
+    const recipesWithUnpriced = await invoke(getRecipes, requestFor({ propertyId: property._id }));
+    const pendingRecipe = recipesWithUnpriced.body.data.find(
+      (entry) => String(entry._id) === String(unpricedRecipe.body.data._id)
+    );
+    expect(pendingRecipe).toMatchObject({
+      totalRecipeCost: null,
+      estimatedRecipeCost: null,
+      estimatedGrossProfit: null,
+      estimatedProfitWhole: null,
+      foodCostPercent: null,
+      costPending: true
+    });
+
+    const missingYieldRecipe = await InventoryRecipe.create({
+      hotelId,
+      propertyId: property._id,
+      menuItemId: unpricedMenuItem._id,
+      recipeName: 'Recipe Without Yield',
+      servingSize: '1 serving',
+      expectedProductionYield: null,
+      expectedPreparationLossPercent: 10,
+      productionMode: 'made_to_order',
+      version: 2,
+      ingredients: [{
+        itemId: purchasePriceIngredient._id,
+        quantity: 2,
+        unit: 'g',
+        conversionFactor: 1
+      }],
+      createdBy: actorId
+    });
+    const recipesWithoutYield = await invoke(getRecipes, requestFor({ propertyId: property._id }));
+    const yieldPendingRecipe = recipesWithoutYield.body.data.find(
+      (entry) => String(entry._id) === String(missingYieldRecipe._id)
+    );
+    expect(yieldPendingRecipe).toMatchObject({
+      totalRecipeCost: 20,
+      estimatedRecipeCost: null,
+      expectedPreparationLossQuantity: null,
+      expectedUsableQuantity: null,
+      estimatedGrossProfit: null,
+      estimatedProfitWhole: null,
+      foodCostPercent: null
     });
   });
 });
