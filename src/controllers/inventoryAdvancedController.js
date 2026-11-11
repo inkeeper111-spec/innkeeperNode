@@ -6,7 +6,9 @@ import {
 } from '../models/index.js';
 import { generateReference } from '../utils/reference.js';
 import { logAudit } from '../services/auditService.js';
-import { postStockMovement, runInventoryTransaction, transferStock } from '../services/inventoryService.js';
+import {
+  getInventoryBatchAverageCosts, postStockMovement, runInventoryTransaction, transferStock
+} from '../services/inventoryService.js';
 import { convertQuantityToBase, getUnitConversionFactor, normalizeInventoryUnit } from '../config/inventoryUnits.js';
 
 const adminOnly = (req, res) => {
@@ -1129,18 +1131,11 @@ export const getRecipes = async (req, res, next) => {
     const itemIds = [...new Set(recipes.flatMap((recipe) => recipe.ingredients.map((ingredient) => (
       String(ingredient.itemId?._id || ingredient.itemId)
     ))))].filter((id) => mongoose.isValidObjectId(id));
-    const batchCosts = itemIds.length ? await InventoryBatch.aggregate([
-      { $match: { ...tenantFilter(req), itemId: { $in: itemIds.map((id) => new mongoose.Types.ObjectId(id)) }, remainingQuantity: { $gt: 0 } } },
-      { $group: {
-        _id: '$itemId',
-        quantity: { $sum: '$remainingQuantity' },
-        value: { $sum: { $multiply: ['$remainingQuantity', '$unitCost'] } }
-      } }
-    ]) : [];
-    const unitCosts = new Map(batchCosts.map((batch) => [
-      String(batch._id),
-      batch.quantity > 0 ? batch.value / batch.quantity : null
-    ]));
+    const unitCosts = await getInventoryBatchAverageCosts({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      itemIds
+    });
     const roundMoney = (amount) => Math.round((amount + Number.EPSILON) * 100) / 100;
     const data = recipes.map((recipe) => {
       let totalRecipeCost = 0;

@@ -166,6 +166,7 @@ export const requireTenant = async (req, res, next) => {
     expenses: 'expenses',
     maintenance: 'maintenance',
     staff: 'staff',
+    payroll: 'staff',
     leave: 'staff',
     reports: 'reports',
     ai: 'ai_assistant'

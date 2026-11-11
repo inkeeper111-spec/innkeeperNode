@@ -762,6 +762,115 @@ describe('recipe-based inventory management', () => {
     });
   });
 
+  it('deducts exact recipe ingredient quantities and ignores expected preparation loss for raw materials', async () => {
+    const property = await Property.create({
+      hotelId,
+      name: 'Loss Isolation Property',
+      code: `LOS${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      address: '3 Test Road',
+      city: 'Test City',
+      state: 'Test State',
+      phone: '5551234569'
+    });
+    const category = await MenuCategory.create({ hotelId, name: 'Loss Isolation Recipes' });
+    const menuItem = await MenuItem.create({
+      hotelId,
+      categoryId: category._id,
+      name: 'Rice Congee',
+      price: 10
+    });
+    const rice = await InventoryItem.create({
+      hotelId,
+      propertyId: property._id,
+      name: 'Ponni rice',
+      code: `RCE${new mongoose.Types.ObjectId().toString().slice(-5)}`,
+      inventoryType: 'raw_material',
+      unit: 'kg',
+      baseUnit: 'kg',
+      currentStock: 0
+    });
+    await runInventoryTransaction((session) => postStockMovement({
+      hotelId,
+      propertyId: property._id,
+      itemId: rice._id,
+      movementType: 'receipt',
+      quantity: 10,
+      unit: 'kg',
+      unitCost: 100,
+      location: 'Main Store',
+      recordedBy: actorId,
+      session
+    }));
+    const recipe = await InventoryRecipe.create({
+      hotelId,
+      propertyId: property._id,
+      menuItemId: menuItem._id,
+      recipeName: 'Rice /congee',
+      productionMode: 'batch_production',
+      expectedProductionYield: 10,
+      expectedPreparationLossPercent: 7,
+      version: 1,
+      ingredients: [{ itemId: rice._id, quantity: 2, unit: 'kg', conversionFactor: 1, baseUnit: 'kg' }],
+      createdBy: actorId
+    });
+
+    // Full recipe batch (10 portions) must deduct exactly 2 kg, not 2.14 kg.
+    const fullBatch = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: {
+        hotelId,
+        propertyId: property._id,
+        recipeId: recipe._id,
+        productionQuantity: 10,
+        acceptedQuantity: 10,
+        productionMethod: 'recipe_based',
+        location: 'Kitchen Store',
+        rawMaterialLocation: 'Main Store',
+        wastage: [],
+        recordedBy: actorId,
+        idempotencyKey: `loss-isolation:${new mongoose.Types.ObjectId()}`
+      }
+    }));
+    expect(fullBatch.statusCode).toBe(201);
+    expect(fullBatch.body.data.batch.ingredients[0]).toMatchObject({
+      theoreticalQuantity: 2,
+      actualQuantity: 2,
+      wastageQuantity: 0
+    });
+    expect((await InventoryItem.findById(rice._id)).currentStock).toBe(8);
+
+    // Explicit wastage remains a separate deduction.
+    const withWastage = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: {
+        hotelId,
+        propertyId: property._id,
+        recipeId: recipe._id,
+        productionQuantity: 10,
+        acceptedQuantity: 10,
+        productionMethod: 'recipe_based',
+        location: 'Kitchen Store',
+        rawMaterialLocation: 'Main Store',
+        wastage: [{ itemId: String(rice._id), quantity: 0.2, unit: 'kg', reason: 'Spill' }],
+        recordedBy: actorId,
+        idempotencyKey: `loss-isolation:${new mongoose.Types.ObjectId()}`
+      }
+    }));
+    expect(withWastage.statusCode).toBe(201);
+    expect(withWastage.body.data.batch.ingredients[0]).toMatchObject({
+      theoreticalQuantity: 2,
+      actualQuantity: 2,
+      wastageQuantity: 0.2
+    });
+    expect((await InventoryItem.findById(rice._id)).currentStock).toBe(5.8);
+    expect(await StockMovement.countDocuments({
+      hotelId,
+      propertyId: property._id,
+      itemId: rice._id,
+      movementType: 'wastage'
+    })).toBe(1);
+  });
+
   it('calculates full-recipe costs from purchase prices and inventory batches, and reports missing costs as pending', async () => {
     const property = await Property.create({
       hotelId,
@@ -787,7 +896,7 @@ describe('recipe-based inventory management', () => {
       inventoryType: 'raw_material',
       unit: 'g',
       baseUnit: 'g',
-      currentStock: 0,
+      currentStock: 2,
       purchasePrice: 40,
       purchaseConversionFactor: 4,
       unitCost: 0
@@ -800,7 +909,7 @@ describe('recipe-based inventory management', () => {
       inventoryType: 'raw_material',
       unit: 'g',
       baseUnit: 'g',
-      currentStock: 0,
+      currentStock: 2,
       unitCost: 0
     });
     await InventoryBatch.create([
@@ -821,6 +930,7 @@ describe('recipe-based inventory management', () => {
         recipeName: 'Costed Recipe',
         expectedProductionYield: 10,
         expectedPreparationLossPercent: 20,
+        productionMode: 'batch_production',
         ingredients: [
           { itemId: String(purchasePriceIngredient._id), quantity: 2, unit: 'g' },
           { itemId: String(batchCostIngredient._id), quantity: 2, unit: 'g' }
@@ -844,6 +954,25 @@ describe('recipe-based inventory management', () => {
       estimatedProfitWhole: 122,
       foodCostPercent: 23.75,
       costPending: false
+    });
+
+    const production = await invoke(createProductionEntry, requestFor({
+      propertyId: property._id,
+      body: {
+        recipeId: String(recipeResponse.body.data._id),
+        productionQuantity: 10,
+        acceptedQuantity: 10,
+        productionMethod: 'recipe_based',
+        location: 'Kitchen Store',
+        rawMaterialLocation: 'Main Store',
+        idempotencyKey: `recipe-cost-production:${new mongoose.Types.ObjectId()}`
+      }
+    }));
+    expect(production.statusCode).toBe(201);
+    expect(production.body.data.batch).toMatchObject({
+      productionCost: 38,
+      costPerPortion: 3.8,
+      sellingPrice: 20
     });
 
     const unpricedMenuItem = await MenuItem.create({

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Payslip - <%= monthLabel %></title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; color: #111; font-size: 12px; margin: 32px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 14px; margin: 16px 0 8px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+    .muted { color: #666; }
+    .grid { display: flex; justify-content: space-between; gap: 24px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    .right { text-align: right; }
+    .totals { margin-top: 16px; width: 40%; margin-left: auto; }
+    .net { font-size: 16px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <div>
+      <h1><%= hotel?.name || 'Organization' %></h1>
+      <div class="muted"><%= hotel?.address || '' %><% if (hotel?.city) { %>, <%= hotel.city %><% } %></div>
+      <div class="muted"><%= hotel?.phone || '' %> <%= hotel?.email || '' %></div>
+    </div>
+    <div style="text-align:right">
+      <h1>Payslip</h1>
+      <div><%= monthLabel %></div>
+    </div>
+  </div>
+
+  <h2>Employee</h2>
+  <table>
+    <tr><th>Name</th><td><%= user?.name || '' %></td><th>Employee ID</th><td><%= staff?.employeeId || '' %></td></tr>
+    <tr><th>Designation</th><td><%= staff?.designation || '' %></td><th>Department</th><td><%= staff?.department || '' %></td></tr>
+    <tr><th>Account Name</th><td><%= bank?.accountName || '' %></td><th>Account No</th><td><%= bank?.accountNo || '' %></td></tr>
+    <tr><th>IFSC</th><td colspan="3"><%= bank?.IFSC || '' %></td></tr>
+  </table>
+
+  <h2>Attendance</h2>
+  <table>
+    <tr>
+      <th>Present</th><td class="right"><%= record.present %></td>
+      <th>Paid Leave</th><td class="right"><%= record.leave %></td>
+      <th>LOP</th><td class="right"><%= record.lop %></td>
+    </tr>
+    <tr>
+      <th>Week Off</th><td class="right"><%= record.weekOff %></td>
+      <th>Holiday</th><td class="right"><%= record.holiday %></td>
+      <th>Leave Deduction (info)</th><td class="right"><%= Number(record.leaveDeduction || 0).toFixed(2) %></td>
+    </tr>
+  </table>
+
+  <div class="grid" style="margin-top:16px">
+    <div style="flex:1">
+      <h2>Earnings</h2>
+      <table>
+        <tr><th>Component</th><th class="right">Amount</th></tr>
+        <tr><td>Gross / Payable</td><td class="right"><%= Number(record.grossSalary || 0).toFixed(2) %></td></tr>
+        <tr><td>Basic</td><td class="right"><%= Number(record.basicSalary || 0).toFixed(2) %></td></tr>
+        <tr><td>Allowances</td><td class="right"><%= Number(record.allowanceSalary || 0).toFixed(2) %></td></tr>
+        <% (record.earnings || []).forEach(function(e) { %>
+          <tr><td><%= e.type %></td><td class="right"><%= Number(e.amount || 0).toFixed(2) %></td></tr>
+        <% }) %>
+      </table>
+    </div>
+    <div style="flex:1">
+      <h2>Deductions</h2>
+      <table>
+        <tr><th>Component</th><th class="right">Amount</th></tr>
+        <tr><td>PF</td><td class="right"><%= Number(record.pf || 0).toFixed(2) %></td></tr>
+        <tr><td>ESI</td><td class="right"><%= Number(record.esi || 0).toFixed(2) %></td></tr>
+        <tr><td>Profession Tax</td><td class="right"><%= Number(record.professionTax || 0).toFixed(2) %></td></tr>
+        <% (record.deductions || []).forEach(function(d) { %>
+          <tr><td><%= d.type %></td><td class="right"><%= Number(d.amount || 0).toFixed(2) %></td></tr>
+        <% }) %>
+        <tr><td>Advance Recovery</td><td class="right"><%= Number(record.advancePayment || 0).toFixed(2) %></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <table class="totals">
+    <tr><th>Net Salary</th><td class="right net"><%= Number(record.netSalary || 0).toFixed(2) %></td></tr>
+  </table>
+
+  <p class="muted" style="margin-top:32px">This is a system-generated payslip.</p>
+</body>
+</html>

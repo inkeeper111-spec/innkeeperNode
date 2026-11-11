@@ -12,6 +12,37 @@ const OPEN_PURCHASE_ORDER_STATUSES = [
   'draft', 'pending_approval', 'approved', 'ordered', 'partially_received'
 ];
 const roundMoney = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+export const getInventoryBatchAverageCosts = async ({ hotelId, propertyId, itemIds, session }) => {
+  const validItemIds = [...new Set(itemIds.map(String))]
+    .filter((id) => mongoose.isValidObjectId(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+  if (!validItemIds.length) return new Map();
+
+  const pipeline = [
+    {
+      $match: {
+        hotelId,
+        ...(propertyId ? { propertyId } : {}),
+        itemId: { $in: validItemIds },
+        remainingQuantity: { $gt: 0 }
+      }
+    },
+    {
+      $group: {
+        _id: '$itemId',
+        quantity: { $sum: '$remainingQuantity' },
+        value: { $sum: { $multiply: ['$remainingQuantity', '$unitCost'] } }
+      }
+    }
+  ];
+  const aggregation = InventoryBatch.aggregate(pipeline);
+  if (session) aggregation.session(session);
+  const batchCosts = await aggregation;
+  return new Map(batchCosts.map((batch) => [
+    String(batch._id),
+    batch.quantity > 0 ? batch.value / batch.quantity : null
+  ]));
+};
 const DEPARTMENT_STOCK_LOCATIONS = {
   Kitchen: 'Kitchen Store',
   Restaurant: 'Restaurant Store',
@@ -139,6 +170,14 @@ export const createProductionBatch = async ({
   }
   const batchNumber = generateReference('PRD');
   const consumedLines = [];
+  const recipeBatchCosts = productionMethod === 'recipe_based'
+    ? await getInventoryBatchAverageCosts({
+      hotelId,
+      propertyId,
+      itemIds: recipe.ingredients.filter((line) => !line.optional).map((line) => line.itemId),
+      session
+    })
+    : new Map();
   let productionCost = 0;
   let rawMaterialWastageCost = 0;
   for (const recipeIngredient of recipe.ingredients) {
@@ -155,11 +194,12 @@ export const createProductionBatch = async ({
       throw Object.assign(new Error(`Enter actual consumption for ${item.name}.`), { statusCode: 400 });
     }
     const unit = normalizeInventoryUnit(enteredLine?.unit || recipeIngredient.unit || item.baseUnit || item.unit);
-    const expectedLossMultiplier = (1 + Number(recipe.expectedPreparationLossPercent || 0) / 100)
-      / Number(recipe.expectedProductionYield || 1);
+    // Scale by portions vs recipe yield only. Expected preparation loss must NOT inflate
+    // raw-material deductions — recipe ingredient qty is exact consumption per full yield.
+    const yieldScale = 1 / Number(recipe.expectedProductionYield || 1);
     const enteredQuantity = productionMethod === 'actual_consumption'
       ? Number(enteredLine.quantity)
-      : Number(recipeIngredient.quantity) * quantity * expectedLossMultiplier;
+      : Number(recipeIngredient.quantity) * quantity * yieldScale;
     if (!Number.isFinite(enteredQuantity) || enteredQuantity < 0
       || (productionMethod === 'actual_consumption' && enteredQuantity <= 0)) {
       throw Object.assign(new Error(`Enter a valid actual quantity for ${item.name}.`), { statusCode: 400 });
@@ -172,9 +212,22 @@ export const createProductionBatch = async ({
     ).quantity;
     const theoreticalBase = roundQuantity(
       Number(recipeIngredient.quantity)
-        * quantity * expectedLossMultiplier
+        * quantity * yieldScale
         * Number(recipeIngredient.conversionFactor || 1)
     );
+    const purchaseConversionFactor = Number(item.purchaseConversionFactor);
+    const purchaseUnitCost = item.purchasePrice !== null && item.purchasePrice !== undefined
+      && Number.isFinite(Number(item.purchasePrice))
+      && Number.isFinite(purchaseConversionFactor)
+      && purchaseConversionFactor > 0
+      ? Number(item.purchasePrice) / purchaseConversionFactor
+      : null;
+    const storedUnitCost = Number(item.unitCost);
+    const recipeUnitCost = recipeBatchCosts.has(String(item._id))
+      ? recipeBatchCosts.get(String(item._id))
+      : purchaseUnitCost ?? (
+        Number.isFinite(storedUnitCost) && storedUnitCost > 0 ? storedUnitCost : null
+      );
     const wastageLine = wastageByItem.get(String(item._id));
     const wastageEntered = Number(wastageLine?.quantity || 0);
     const wastageReason = String(wastageLine?.reason || '').trim();
@@ -225,7 +278,10 @@ export const createProductionBatch = async ({
       wastageCost = wastageResult.movement.totalValue;
     }
     const actualCost = consumptionMovement.movement.totalValue;
-    productionCost += actualCost;
+    const ingredientCost = productionMethod === 'recipe_based' && recipeUnitCost !== null
+      ? theoreticalBase * recipeUnitCost
+      : actualCost;
+    productionCost += ingredientCost;
     rawMaterialWastageCost += wastageCost;
     consumedLines.push({
       itemId: item._id,
@@ -236,9 +292,9 @@ export const createProductionBatch = async ({
       unit: item.baseUnit || item.unit,
       conversionFactor: 1,
       unitCost: consumptionMovement.movement.quantity > 0
-        ? actualCost / consumptionMovement.movement.quantity
+        ? ingredientCost / consumptionMovement.movement.quantity
         : 0,
-      totalCost: actualCost,
+      totalCost: roundMoney(ingredientCost),
       wastageCost,
       movementId: consumptionMovement.movement._id,
       wastageMovementId: wastageMovement?._id || null,
