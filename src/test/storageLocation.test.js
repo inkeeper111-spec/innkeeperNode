@@ -4,7 +4,7 @@ import {
   InventoryBalance, InventoryBatch, InventoryItem, StockMovement,
   StorageLocation, StorageLocationType
 } from '../models/index.js';
-import { ensureLegacyStorageLocations, resolveStorageLocation } from '../services/storageLocationService.js';
+import { ensureLegacyStorageLocations, getStorageLocationStock, resolveStorageLocation } from '../services/storageLocationService.js';
 import { runInventoryTransaction, transferStock } from '../services/inventoryService.js';
 import { setup, teardown } from './setup.js';
 
@@ -179,5 +179,54 @@ describe('storage location master', () => {
       recordedBy: actorId,
       session
     }))).rejects.toThrow('different from the source storage location');
+  });
+
+  it('returns received, used, and current stock for one storage location', async () => {
+    const hotelId = new mongoose.Types.ObjectId();
+    const propertyId = new mongoose.Types.ObjectId();
+    const otherPropertyId = new mongoose.Types.ObjectId();
+    const types = await ensureLegacyStorageLocations(hotelId);
+    const mainType = types.find((type) => type.key === 'main_store');
+    const location = await StorageLocation.create({
+      hotelId,
+      locationName: 'Main Store - Stock Report',
+      normalizedName: 'main store - stock report',
+      locationTypeId: mainType._id
+    });
+    const rice = await InventoryItem.create({
+      hotelId, propertyId, name: 'Rice', code: `RC-${new mongoose.Types.ObjectId().toString().slice(-8)}`,
+      unit: 'kg', baseUnit: 'kg', currentStock: 8
+    });
+    await InventoryBatch.create({
+      hotelId, propertyId, itemId: rice._id, location: location.locationName, locationId: location._id,
+      batchNumber: 'RICE-1', quantity: 10, remainingQuantity: 6, unitCost: 4
+    });
+    await InventoryBatch.create({
+      hotelId, propertyId, itemId: rice._id, location: location.locationName, locationId: location._id,
+      batchNumber: 'RICE-2', quantity: 5, remainingQuantity: 2, unitCost: 6
+    });
+    await InventoryBatch.create({
+      hotelId, propertyId: otherPropertyId, itemId: rice._id, location: location.locationName, locationId: location._id,
+      batchNumber: 'OTHER-PROPERTY', quantity: 100, remainingQuantity: 100, unitCost: 1
+    });
+
+    const report = await getStorageLocationStock({ hotelId, propertyId, locationId: location._id });
+
+    expect(report.locationName).toBe('Main Store - Stock Report');
+    expect(report.items).toHaveLength(1);
+    expect(report.items[0]).toMatchObject({
+      itemName: 'Rice',
+      batchCount: 2,
+      receivedQuantity: 15,
+      usedQuantity: 7,
+      currentQuantity: 8,
+      unit: 'kg',
+      currentValue: 36,
+      purchaseValue: 70
+    });
+    expect(report.currentValue).toBe(36);
+    expect(await getStorageLocationStock({
+      hotelId, propertyId, locationId: new mongoose.Types.ObjectId()
+    })).toBeNull();
   });
 });

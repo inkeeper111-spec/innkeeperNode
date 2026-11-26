@@ -84,6 +84,7 @@ import {
 } from '../controllers/productionController.js';
 import {
   createStorageLocation,
+  getStorageLocationStockReport,
   getStorageLocationTypes,
   getStorageLocations,
   updateStorageLocation
@@ -162,6 +163,7 @@ router.post('/verifications', createStockVerification);
 router.get('/locations', getStockLocations);
 router.get('/storage-location-types', getStorageLocationTypes);
 router.get('/storage-locations', getStorageLocations);
+router.get('/storage-locations/:id/stock', getStorageLocationStockReport);
 router.post('/storage-locations', authorize(), createStorageLocation);
 router.patch('/storage-locations/:id', authorize(), updateStorageLocation);
 router.post('/transfers', authorize(), transferStockBetweenLocations);

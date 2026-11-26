@@ -211,9 +211,73 @@ export const resolveStorageLocation = async ({
   });
 };
 
-export const getStorageLocationStock = async (hotelId, locationId) => (
-  InventoryBalance.aggregate([
-    { $match: { hotelId: new mongoose.Types.ObjectId(hotelId), locationId: new mongoose.Types.ObjectId(locationId), quantity: { $gt: 0 } } },
-    { $group: { _id: null, quantity: { $sum: '$quantity' } } }
-  ])
-);
+const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+export const getStorageLocationStock = async ({ hotelId, propertyId, locationId }) => {
+  const location = await StorageLocation.findOne({ _id: locationId, hotelId }).lean();
+  if (!location) return null;
+
+  const rows = await InventoryBatch.aggregate([
+    {
+      $match: {
+        hotelId: new mongoose.Types.ObjectId(hotelId),
+        propertyId: new mongoose.Types.ObjectId(propertyId),
+        locationId: new mongoose.Types.ObjectId(locationId),
+        quantity: { $gt: 0 }
+      }
+    },
+    {
+      $group: {
+        _id: '$itemId',
+        receivedQuantity: { $sum: '$quantity' },
+        currentQuantity: { $sum: '$remainingQuantity' },
+        currentValue: { $sum: { $multiply: ['$remainingQuantity', '$unitCost'] } },
+        purchaseValue: { $sum: { $multiply: ['$quantity', '$unitCost'] } },
+        batchCount: { $sum: 1 }
+      }
+    },
+    {
+      $lookup: {
+        from: InventoryItem.collection.name,
+        localField: '_id',
+        foreignField: '_id',
+        as: 'item'
+      }
+    },
+    { $unwind: { path: '$item', preserveNullAndEmptyArrays: true } },
+    { $sort: { 'item.name': 1 } }
+  ]);
+
+  const items = rows.map((row) => {
+    const receivedQuantity = Number(row.receivedQuantity) || 0;
+    const currentQuantity = Number(row.currentQuantity) || 0;
+    const currentValue = roundMoney(row.currentValue);
+    const purchaseValue = roundMoney(row.purchaseValue);
+    const averageUnitCost = currentQuantity > 0
+      ? roundMoney(currentValue / currentQuantity)
+      : receivedQuantity > 0
+        ? roundMoney(purchaseValue / receivedQuantity)
+        : 0;
+    return {
+      itemId: row._id,
+      itemName: row.item?.name || 'Unknown item',
+      itemCode: row.item?.code || '',
+      batchCount: row.batchCount || 0,
+      receivedQuantity,
+      usedQuantity: Math.max(0, receivedQuantity - currentQuantity),
+      currentQuantity,
+      unit: row.item?.baseUnit || row.item?.unit || '',
+      averageUnitCost,
+      currentValue,
+      purchaseValue
+    };
+  });
+
+  return {
+    locationId: location._id,
+    locationName: location.locationName,
+    items,
+    currentValue: roundMoney(items.reduce((sum, item) => sum + item.currentValue, 0)),
+    purchaseValue: roundMoney(items.reduce((sum, item) => sum + item.purchaseValue, 0))
+  };
+};

@@ -6,6 +6,7 @@ import { StorageLocationType } from '../models/StorageLocationType.js';
 import { logAudit } from '../services/auditService.js';
 import {
   ensureLegacyStorageLocations,
+  getStorageLocationStock,
   STORAGE_LOCATION_TYPES
 } from '../services/storageLocationService.js';
 
@@ -53,6 +54,23 @@ export const getStorageLocations = async (req, res, next) => {
       .sort({ isActive: -1, locationName: 1 })
       .lean();
     res.json({ success: true, data: locations });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getStorageLocationStockReport = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Storage location not found.' });
+    }
+    const data = await getStorageLocationStock({
+      hotelId: req.hotelId,
+      propertyId: req.propertyId,
+      locationId: req.params.id
+    });
+    if (!data) return res.status(404).json({ success: false, message: 'Storage location not found.' });
+    res.json({ success: true, data });
   } catch (error) {
     next(error);
   }
